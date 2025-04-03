@@ -11,7 +11,7 @@ This is the repository for my build of `st` with the following patches applied:
 
 ## Installation
 
-Install dependencies:
+All of the patches have already been applied, so you can simply clone the repository and run `sudo make clean install`. If you need to build from scratch, clone the `st` repo from suckless and then install build dependencies:
 
 ```sh
 sudo apt install build-essential libx11-dev libxft-dev libxrender-dev
