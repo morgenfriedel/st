@@ -11,14 +11,19 @@
 #define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
 #define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
 #define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
-#define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || \
-				(a).bg != (b).bg)
+#define ATTRCMP(a, b)		(((a).mode & (~ATTR_WRAP)) != ((b).mode & (~ATTR_WRAP)) || \
+				(a).fg != (b).fg || \
+				(a).bg != (b).bg || \
+				(a).ustyle != (b).ustyle || \
+				(a).ucolor != (b).ucolor)
 #define TIMEDIFF(t1, t2)	((t1.tv_sec-t2.tv_sec)*1000 + \
 				(t1.tv_nsec-t2.tv_nsec)/1E6)
 #define MODBIT(x, set, bit)	((set) ? ((x) |= (bit)) : ((x) &= ~(bit)))
 
 #define TRUECOLOR(r,g,b)	(1 << 24 | (r) << 16 | (g) << 8 | (b))
 #define IS_TRUECOL(x)		(1 << 24 & (x))
+/* Glyph.ucolor holds a color like fg, flagged; 0 means "same as fg" */
+#define UCOLOR_SET		(1 << 25)
 
 enum glyph_attribute {
 	ATTR_NULL       = 0,
@@ -35,6 +40,15 @@ enum glyph_attribute {
 	ATTR_WDUMMY     = 1 << 10,
 	ATTR_BOXDRAW    = 1 << 11,
 	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
+};
+
+/* Glyph.ustyle, meaningful while ATTR_UNDERLINE is set (SGR 4:n) */
+enum underline_style {
+	UL_SINGLE = 1,
+	UL_DOUBLE = 2,
+	UL_CURLY  = 3,
+	UL_DOTTED = 4,
+	UL_DASHED = 5,
 };
 
 enum selection_mode {
@@ -64,8 +78,11 @@ typedef uint_least32_t Rune;
 typedef struct {
 	Rune u;           /* character code */
 	ushort mode;      /* attribute flags */
+	uchar ustyle;     /* underline style */
 	uint32_t fg;      /* foreground  */
 	uint32_t bg;      /* background  */
+	uint32_t link;    /* OSC 8 hyperlink id, 0 if none */
+	uint32_t ucolor;  /* underline color */
 } Glyph;
 
 typedef Glyph *Line;
@@ -90,6 +107,11 @@ void sendbreak(const Arg *);
 void toggleprinter(const Arg *);
 
 int tattrset(int);
+int tisaltscr(void);
+void newterm(const Arg *);
+void spawn(const char **, const char *);
+int tinsync(uint);
+char *turlat(int, int);
 void tnew(int, int);
 void tresize(int, int);
 void tsetdirtattr(int);
@@ -135,4 +157,6 @@ extern unsigned int tabspaces;
 extern unsigned int defaultfg;
 extern unsigned int defaultbg;
 extern unsigned int defaultcs;
+extern int scrollback;
+extern const char *urlschemes[];
 extern const int boxdraw, boxdraw_bold, boxdraw_braille;

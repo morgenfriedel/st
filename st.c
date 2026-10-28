@@ -8,12 +8,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <wchar.h>
 
@@ -35,7 +37,8 @@
 #define ESC_ARG_SIZ   16
 #define STR_BUF_SIZ   ESC_BUF_SIZ
 #define STR_ARG_SIZ   ESC_ARG_SIZ
-#define HISTSIZE      2000
+#define HISTSIZE      scrollback
+#define LINKSIZ       1024 /* remembered OSC 8 hyperlinks */
 
 /* macros */
 #define IS_SET(flag)		((term.mode & (flag)) != 0)
@@ -119,7 +122,7 @@ typedef struct {
 	int col;      /* nb col */
 	Line *line;   /* screen */
 	Line *alt;    /* alternate screen */
-	Line hist[HISTSIZE]; /* history buffer */
+	Line *hist;   /* history buffer, HISTSIZE lines */
 	int histi;    /* history index */
 	int scr;      /* scroll back */
 	int *dirty;   /* dirtyness of lines */
@@ -144,6 +147,7 @@ typedef struct {
 	size_t len;            /* raw string length */
 	char priv;
 	int arg[ESC_ARG_SIZ];
+	char sub[ESC_ARG_SIZ]; /* arg was a ':' sub-parameter of the one before */
 	int narg;              /* nb of args */
 	char mode[2];
 } CSIEscape;
@@ -159,6 +163,19 @@ typedef struct {
 	int narg;              /* nb of args */
 } STREscape;
 
+/* OSC 8 hyperlinks: ring of recent URIs, addressed by a growing id */
+typedef struct {
+	uint32_t id;
+	char *uri;
+} Link;
+
+static Link links[LINKSIZ];
+static uint32_t lastlinkid;
+
+/* DEC mode 2026: synchronized updates */
+static int su;
+static struct timespec sutv;
+
 static void execsh(char *, char **);
 static void stty(char **);
 static void sigchld(int);
@@ -172,6 +189,8 @@ static void osc_color_response(int, int, int);
 static int eschandle(uchar);
 static void strdump(void);
 static void strhandle(void);
+static void oschyperlink(void);
+static char *linkuri(uint32_t);
 static void strparse(void);
 static void strreset(void);
 
@@ -194,7 +213,7 @@ static void tputc(Rune);
 static void treset(void);
 static void tscrollup(int, int, int);
 static void tscrolldown(int, int, int);
-static void tsetattr(const int *, int);
+static void tsetattr(const int *, const char *, int);
 static void tsetchar(Rune, const Glyph *, int, int);
 static void tsetdirt(int, int);
 static void tsetscroll(int, int);
@@ -205,7 +224,7 @@ static void tfulldirt(void);
 static void tcontrolcode(uchar );
 static void tdectest(char );
 static void tdefutf8(char);
-static int32_t tdefcolor(const int *, int *, int);
+static int32_t tdefcolor(const int *, const char *, int *, int);
 static void tdeftran(char);
 static void tstrsequence(uchar);
 
@@ -955,6 +974,204 @@ ttyhangup(void)
 	kill(pid, SIGHUP);
 }
 
+/*
+ * Run argv[0] in dir (if not NULL), fully detached: the double fork leaves
+ * no zombie for sigchld to miss, and closing inherited descriptors keeps a
+ * long-lived child, like a browser, from holding the pty open after st
+ * exits.
+ */
+void
+spawn(const char **argv, const char *dir)
+{
+	pid_t p;
+	int fd;
+	long maxfd;
+
+	switch ((p = fork())) {
+	case -1:
+		fprintf(stderr, "fork failed: %s\n", strerror(errno));
+		return;
+	case 0:
+		if (fork() != 0)
+			_exit(0);
+		setsid();
+		maxfd = sysconf(_SC_OPEN_MAX);
+		for (fd = 3; fd < (maxfd > 0 ? MIN(maxfd, 65536) : 1024); fd++)
+			close(fd);
+		if ((fd = open("/dev/null", O_RDWR)) >= 0)
+			dup2(fd, STDIN_FILENO);
+		if (dir && chdir(dir) < 0)
+			fprintf(stderr, "st: chdir %s failed: %s\n", dir,
+			        strerror(errno));
+		execvp(argv[0], (char *const *)argv);
+		fprintf(stderr, "st: execvp %s failed: %s\n", argv[0],
+		        strerror(errno));
+		_exit(1);
+	default:
+		while (waitpid(p, NULL, 0) < 0 && errno == EINTR)
+			;
+	}
+}
+
+/*
+ * Open another st in the working directory of what runs in the foreground
+ * here: the shell, or a program it started (an editor, Claude Code, ...).
+ */
+void
+newterm(const Arg *a)
+{
+	const char *argv[] = { "st", NULL };
+	char path[32], *cwd;
+	pid_t fg = tcgetpgrp(cmdfd);
+
+	snprintf(path, sizeof(path), "/proc/%d/cwd", fg > 0 ? fg : pid);
+	if (!(cwd = realpath(path, NULL))) {
+		snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
+		cwd = realpath(path, NULL);
+	}
+	spawn(argv, cwd);
+	free(cwd);
+}
+
+int
+tisaltscr(void)
+{
+	return IS_SET(MODE_ALTSCREEN);
+}
+
+/* whether drawing is held back by a synchronized update; it expires */
+int
+tinsync(uint timeout)
+{
+	struct timespec now;
+
+	if (su) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (TIMEDIFF(now, sutv) >= timeout)
+			su = 0;
+	}
+	return su;
+}
+
+/* length of the allowed scheme that s starts with, or 0 */
+static size_t
+urlscheme(const Rune *s, size_t n)
+{
+	const char **sc;
+	size_t i;
+
+	for (sc = urlschemes; *sc; sc++) {
+		for (i = 0; (*sc)[i] && i < n; i++) {
+			if (s[i] >= 128 || tolower(s[i]) != (*sc)[i])
+				break;
+		}
+		if (!(*sc)[i])
+			return i;
+	}
+	return 0;
+}
+
+static int
+isurlrune(Rune u)
+{
+	return u > ' ' && u != 0x7f && !BETWEEN(u, 0x2500, 0x259f) &&
+	       !wcschr(L"<>\"'`{}|\\^", u);
+}
+
+/*
+ * URL under the cell at (x, y) on screen, as a newly allocated string, or
+ * NULL. An OSC 8 hyperlink wins; otherwise a URL is looked for in the text,
+ * following soft-wrapped lines. Only schemes in urlschemes are returned.
+ */
+char *
+turlat(int x, int y)
+{
+	const char **sc;
+	Rune *r;
+	Glyph *gp;
+	char *uri, *s;
+	size_t n, b, e, click, i, len, open, close;
+	int yb, ye, yy, xx;
+
+	if (!BETWEEN(x, 0, term.col-1) || !BETWEEN(y, 0, term.row-1))
+		return NULL;
+	if ((TLINE(y)[x].mode & ATTR_WDUMMY) && x > 0)
+		x--;
+
+	if ((uri = linkuri(TLINE(y)[x].link))) {
+		for (sc = urlschemes; *sc; sc++) {
+			len = strlen(*sc);
+			if (!strncasecmp(uri, *sc, len) && uri[len])
+				return xstrdup(uri);
+		}
+		return NULL;
+	}
+
+	for (yb = y; yb > 0 && (TLINE(yb-1)[term.col-1].mode & ATTR_WRAP); yb--)
+		;
+	for (ye = y; ye < term.row-1 && (TLINE(ye)[term.col-1].mode & ATTR_WRAP); ye++)
+		;
+
+	r = xmalloc((ye - yb + 1) * term.col * sizeof(Rune));
+	n = click = 0;
+	for (yy = yb; yy <= ye; yy++) {
+		for (xx = 0; xx < term.col; xx++) {
+			gp = &TLINE(yy)[xx];
+			if (gp->mode & ATTR_WDUMMY)
+				continue;
+			if (yy == y && xx == x)
+				click = n;
+			r[n++] = gp->u;
+		}
+	}
+
+	uri = NULL;
+	if (!isurlrune(r[click]))
+		goto done;
+	for (b = click; b > 0 && isurlrune(r[b-1]); b--)
+		;
+	for (e = click + 1; e < n && isurlrune(r[e]); e++)
+		;
+
+	/* the scheme closest before the click starts the URL */
+	for (i = click + 1, len = 0; i-- > b;) {
+		if ((len = urlscheme(&r[i], e - i)))
+			break;
+	}
+	if (!len)
+		goto done;
+	b = i;
+
+	/* drop trailing punctuation and unbalanced closing brackets */
+	for (;;) {
+		if (e > b + len && wcschr(L".,:;!?", r[e-1])) {
+			e--;
+			continue;
+		}
+		if (e > b + len && (r[e-1] == ')' || r[e-1] == ']')) {
+			for (i = b, open = close = 0; i < e; i++) {
+				open += r[i] == (r[e-1] == ')' ? '(' : '[');
+				close += r[i] == r[e-1];
+			}
+			if (close > open) {
+				e--;
+				continue;
+			}
+		}
+		break;
+	}
+	if (e <= b + len || click >= e)
+		goto done;
+
+	uri = s = xmalloc((e - b) * UTF_SIZ + 1);
+	for (i = b; i < e; i++)
+		s += utf8encode(r[i], s);
+	*s = '\0';
+done:
+	free(r);
+	return uri;
+}
+
 int
 tattrset(int attr)
 {
@@ -1049,6 +1266,9 @@ void
 tnew(int col, int row)
 {
 	term = (Term){ .c = { .attr = { .fg = defaultfg, .bg = defaultbg } } };
+	LIMIT(scrollback, 1, 1000000);
+	term.hist = xmalloc(HISTSIZE * sizeof(Line));
+	memset(term.hist, 0, HISTSIZE * sizeof(Line));
 	tresize(col, row);
 	treset();
 }
@@ -1194,7 +1414,7 @@ csiparse(void)
 {
 	char *p = csiescseq.buf, *np;
 	long int v;
-	int sep = ';'; /* colon or semi-colon, but not both */
+	char sub = 0;
 
 	csiescseq.narg = 0;
 	if (*p == '?') {
@@ -1210,13 +1430,12 @@ csiparse(void)
 			v = 0;
 		if (v == LONG_MAX || v == LONG_MIN)
 			v = -1;
+		csiescseq.sub[csiescseq.narg] = sub;
 		csiescseq.arg[csiescseq.narg++] = v;
 		p = np;
-		if (sep == ';' && *p == ':')
-			sep = ':'; /* allow override to colon once */
-		if (*p != sep || csiescseq.narg == ESC_ARG_SIZ)
+		if ((*p != ';' && *p != ':') || csiescseq.narg == ESC_ARG_SIZ)
 			break;
-		p++;
+		sub = *p++ == ':';
 	}
 	csiescseq.mode[0] = *p++;
 	csiescseq.mode[1] = (p < csiescseq.buf+csiescseq.len) ? *p : '\0';
@@ -1310,6 +1529,9 @@ tclearregion(int x1, int y1, int x2, int y2)
 			gp->fg = term.c.attr.fg;
 			gp->bg = term.c.attr.bg;
 			gp->mode = 0;
+			gp->ustyle = 0;
+			gp->ucolor = 0;
+			gp->link = 0;
 			gp->u = ' ';
 		}
 	}
@@ -1364,13 +1586,19 @@ tdeleteline(int n)
 }
 
 int32_t
-tdefcolor(const int *attr, int *npar, int l)
+tdefcolor(const int *attr, const char *sub, int *npar, int l)
 {
 	int32_t idx = -1;
 	uint r, g, b;
+	int n;
 
 	switch (attr[*npar + 1]) {
 	case 2: /* direct color in RGB space */
+		/* 38:2:<colorspace>:r:g:b carries an (ignored) colorspace id */
+		for (n = 1; *npar + n < l && sub[*npar + n]; n++)
+			;
+		if (n - 1 >= 5)
+			(*npar)++;
 		if (*npar + 4 >= l) {
 			fprintf(stderr,
 				"erresc(38): Incorrect number of parameters (%d)\n",
@@ -1414,7 +1642,7 @@ tdefcolor(const int *attr, int *npar, int l)
 }
 
 void
-tsetattr(const int *attr, int l)
+tsetattr(const int *attr, const char *sub, int l)
 {
 	int i;
 	int32_t idx;
@@ -1422,6 +1650,8 @@ tsetattr(const int *attr, int l)
 	for (i = 0; i < l; i++) {
 		switch (attr[i]) {
 		case 0:
+			term.c.attr.ustyle = 0;
+			term.c.attr.ucolor = 0;
 			term.c.attr.mode &= ~(
 				ATTR_BOLD       |
 				ATTR_FAINT      |
@@ -1444,6 +1674,19 @@ tsetattr(const int *attr, int l)
 			term.c.attr.mode |= ATTR_ITALIC;
 			break;
 		case 4:
+			term.c.attr.ustyle = UL_SINGLE;
+			if (i + 1 < l && sub[i + 1]) {
+				if (!attr[++i]) {
+					term.c.attr.mode &= ~ATTR_UNDERLINE;
+					break;
+				}
+				if (BETWEEN(attr[i], UL_SINGLE, UL_DASHED))
+					term.c.attr.ustyle = attr[i];
+			}
+			term.c.attr.mode |= ATTR_UNDERLINE;
+			break;
+		case 21: /* doubly underlined */
+			term.c.attr.ustyle = UL_DOUBLE;
 			term.c.attr.mode |= ATTR_UNDERLINE;
 			break;
 		case 5: /* slow blink */
@@ -1482,18 +1725,25 @@ tsetattr(const int *attr, int l)
 			term.c.attr.mode &= ~ATTR_STRUCK;
 			break;
 		case 38:
-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
+			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
 				term.c.attr.fg = idx;
 			break;
 		case 39:
 			term.c.attr.fg = defaultfg;
 			break;
 		case 48:
-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
+			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
 				term.c.attr.bg = idx;
 			break;
 		case 49:
 			term.c.attr.bg = defaultbg;
+			break;
+		case 58: /* underline color */
+			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
+				term.c.attr.ucolor = idx | UCOLOR_SET;
+			break;
+		case 59:
+			term.c.attr.ucolor = 0;
 			break;
 		default:
 			if (BETWEEN(attr[i], 30, 37)) {
@@ -1512,6 +1762,9 @@ tsetattr(const int *attr, int l)
 			}
 			break;
 		}
+		/* sub-parameters nobody consumed are not attributes */
+		while (i + 1 < l && sub[i + 1])
+			i++;
 	}
 }
 
@@ -1618,6 +1871,11 @@ tsetmode(int priv, int set, const int *args, int narg)
 				break;
 			case 2004: /* 2004: bracketed paste mode */
 				xsetmode(set, MODE_BRCKTPASTE);
+				break;
+			case 2026: /* 2026: synchronized updates */
+				su = set;
+				if (set)
+					clock_gettime(CLOCK_MONOTONIC, &sutv);
 				break;
 			/* Not implemented mouse modes. See comments there. */
 			case 1001: /* mouse highlight mode; can hang the
@@ -1836,7 +2094,16 @@ csihandle(void)
 		tsetmode(csiescseq.priv, 1, csiescseq.arg, csiescseq.narg);
 		break;
 	case 'm': /* SGR -- Terminal attribute (color) */
-		tsetattr(csiescseq.arg, csiescseq.narg);
+		tsetattr(csiescseq.arg, csiescseq.sub, csiescseq.narg);
+		break;
+	case '$': /* DECRQM -- Request mode; only modes we can answer for */
+		if (csiescseq.mode[1] != 'p' || !csiescseq.priv)
+			goto unknown;
+		if (csiescseq.arg[0] == 2026) {
+			len = snprintf(buf, sizeof(buf), "\033[?2026;%d$y",
+			               su ? 1 : 2);
+			ttywrite(buf, len, 0);
+		}
 		break;
 	case 'n': /* DSR -- Device Status Report */
 		switch (csiescseq.arg[0]) {
@@ -1940,6 +2207,50 @@ osc_color_response(int num, int index, int is_osc4)
 	}
 }
 
+/*
+ * OSC 8 ; params ; URI ST. The URI may itself contain ';', which strparse
+ * has split on, so it is reassembled from the remaining arguments.
+ */
+void
+oschyperlink(void)
+{
+	char *uri, *p;
+	Link *l;
+
+	if (strescseq.narg < 3 || !*strescseq.args[2]) {
+		term.c.attr.link = 0;
+		return;
+	}
+	uri = strescseq.args[2];
+	for (p = uri; p < strescseq.buf + strescseq.len; p++) {
+		if (!*p)
+			*p = ';';
+	}
+
+	/* consecutive spans of the same link share an id */
+	l = &links[lastlinkid % LINKSIZ];
+	if (lastlinkid && l->id == lastlinkid && !strcmp(l->uri, uri)) {
+		term.c.attr.link = lastlinkid;
+		return;
+	}
+	if (++lastlinkid == 0)
+		lastlinkid = 1;
+	l = &links[lastlinkid % LINKSIZ];
+	free(l->uri);
+	l->id = lastlinkid;
+	l->uri = xstrdup(uri);
+	term.c.attr.link = lastlinkid;
+}
+
+/* URI of a hyperlink id, or NULL once it has been evicted from the ring */
+char *
+linkuri(uint32_t id)
+{
+	Link *l = &links[id % LINKSIZ];
+
+	return (id && l->id == id) ? l->uri : NULL;
+}
+
 void
 strhandle(void)
 {
@@ -1971,6 +2282,9 @@ strhandle(void)
 		case 2:
 			if (narg > 1)
 				xsettitle(strescseq.args[1]);
+			return;
+		case 8:
+			oschyperlink();
 			return;
 		case 52:
 			if (narg > 2 && allowwindowops) {
@@ -2740,7 +3054,8 @@ draw(void)
 	drawregion(0, 0, term.col, term.row);
 	if (term.scr == 0)
 		xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
-				term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
+				term.ocx, term.ocy, term.line[term.ocy][term.ocx],
+				term.line[term.ocy], term.col);
 	term.ocx = cx;
 	term.ocy = term.c.y;
 	xfinishdraw();

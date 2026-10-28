@@ -1,0 +1,1014 @@
+--- a/config.def.h
++++ b/config.def.h
+@@ -1,8 +1,11 @@
+ /* See LICENSE file for copyright and license details. */
+ 
+ 
+-/* scrollback */
+-static unsigned int scrollback = 10000;  // lines stored in scrollback buffer
++/*
++ * scrollback: lines of history kept. Each is allocated at full width when
++ * the window opens, so memory grows with scrollback * columns.
++ */
++int scrollback = 10000;
+ 
+ /*
+  * appearance
+@@ -191,6 +194,25 @@
+ static uint forcemousemod = ShiftMask;
+ 
+ /*
++ * Clicking Button1 with urlmod held opens the URL under the pointer with
++ * urlopener (given the URL as its only argument). OSC 8 hyperlinks are used
++ * when present, otherwise URLs are found in the text. Only URLs starting
++ * with one of urlschemes are opened. This takes priority over apps that
++ * grab the mouse.
++ */
++static uint urlmod = ControlMask;
++static char *urlopener = "xdg-open";
++const char *urlschemes[] = {
++	"https://", "http://", "ftp://", "file://", "mailto:", NULL
++};
++
++/*
++ * Synchronized updates (DEC mode 2026): the longest time, in ms, to hold
++ * drawing while an app is redrawing, should it never end the update.
++ */
++static uint su_timeout = 200;
++
++/*
+  * Xresources preferences to load at startup
+  */
+ ResourcePref resources[] = {
+@@ -215,6 +237,7 @@
+ 		{ "foreground",   STRING,  &colorname[257] },
+ 		{ "cursorColor",  STRING,  &colorname[258] },
+ 		{ "termname",     STRING,  &termname },
++		{ "urlopener",    STRING,  &urlopener },
+ 		{ "shell",        STRING,  &shell },
+ 		{ "minlatency",   INTEGER, &minlatency },
+ 		{ "maxlatency",   INTEGER, &maxlatency },
+@@ -231,13 +254,21 @@
+  * Internal mouse shortcuts.
+  * Beware that overloading Button1 will disable the selection.
+  */
++/*
++ * screen: S_PRI applies on the normal screen (shell, with scrollback),
++ * S_ALT on the alternate screen (full-screen apps), S_ALL on both.
++ */
+ static MouseShortcut mshortcuts[] = {
+-	/* mask                 button   function        argument       release */
++	/* mask                 button   function        argument       release  screen */
+ 	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},      1 },
+-	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"} },
+-	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"} },
+-	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"} },
+-	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"} },
++	{ ShiftMask,            Button4, kscrollup,      {.i = -1},     0,       S_PRI },
++	{ ShiftMask,            Button5, kscrolldown,    {.i = -1},     0,       S_PRI },
++	{ XK_ANY_MOD,           Button4, kscrollup,      {.i = 3},      0,       S_PRI },
++	{ XK_ANY_MOD,           Button5, kscrolldown,    {.i = 3},      0,       S_PRI },
++	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"}, 0, S_ALT },
++	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"}, 0,      S_ALT },
++	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"}, 0, S_ALT },
++	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"}, 0,      S_ALT },
+ };
+ 
+ /* Internal keyboard shortcuts. */
+@@ -258,6 +289,7 @@
+ 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
+ 	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
+ 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
++	{ TERMMOD,              XK_Return,      newterm,        {.i =  0} },
+ 	{ ShiftMask,            XK_Page_Up,     kscrollup,      {.i = -1} },
+   { ShiftMask,            XK_Page_Down,   kscrolldown,    {.i = -1} },
+   { ShiftMask,            XK_Up,          kscrollup,      {.i =  1} },
+--- a/st.c
++++ b/st.c
+@@ -8,12 +8,14 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <signal.h>
+ #include <sys/ioctl.h>
+ #include <sys/select.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <termios.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <wchar.h>
+ 
+@@ -35,7 +37,8 @@
+ #define ESC_ARG_SIZ   16
+ #define STR_BUF_SIZ   ESC_BUF_SIZ
+ #define STR_ARG_SIZ   ESC_ARG_SIZ
+-#define HISTSIZE      2000
++#define HISTSIZE      scrollback
++#define LINKSIZ       1024 /* remembered OSC 8 hyperlinks */
+ 
+ /* macros */
+ #define IS_SET(flag)		((term.mode & (flag)) != 0)
+@@ -119,7 +122,7 @@
+ 	int col;      /* nb col */
+ 	Line *line;   /* screen */
+ 	Line *alt;    /* alternate screen */
+-	Line hist[HISTSIZE]; /* history buffer */
++	Line *hist;   /* history buffer, HISTSIZE lines */
+ 	int histi;    /* history index */
+ 	int scr;      /* scroll back */
+ 	int *dirty;   /* dirtyness of lines */
+@@ -144,6 +147,7 @@
+ 	size_t len;            /* raw string length */
+ 	char priv;
+ 	int arg[ESC_ARG_SIZ];
++	char sub[ESC_ARG_SIZ]; /* arg was a ':' sub-parameter of the one before */
+ 	int narg;              /* nb of args */
+ 	char mode[2];
+ } CSIEscape;
+@@ -159,6 +163,19 @@
+ 	int narg;              /* nb of args */
+ } STREscape;
+ 
++/* OSC 8 hyperlinks: ring of recent URIs, addressed by a growing id */
++typedef struct {
++	uint32_t id;
++	char *uri;
++} Link;
++
++static Link links[LINKSIZ];
++static uint32_t lastlinkid;
++
++/* DEC mode 2026: synchronized updates */
++static int su;
++static struct timespec sutv;
++
+ static void execsh(char *, char **);
+ static void stty(char **);
+ static void sigchld(int);
+@@ -172,6 +189,8 @@
+ static int eschandle(uchar);
+ static void strdump(void);
+ static void strhandle(void);
++static void oschyperlink(void);
++static char *linkuri(uint32_t);
+ static void strparse(void);
+ static void strreset(void);
+ 
+@@ -194,7 +213,7 @@
+ static void treset(void);
+ static void tscrollup(int, int, int);
+ static void tscrolldown(int, int, int);
+-static void tsetattr(const int *, int);
++static void tsetattr(const int *, const char *, int);
+ static void tsetchar(Rune, const Glyph *, int, int);
+ static void tsetdirt(int, int);
+ static void tsetscroll(int, int);
+@@ -205,7 +224,7 @@
+ static void tcontrolcode(uchar );
+ static void tdectest(char );
+ static void tdefutf8(char);
+-static int32_t tdefcolor(const int *, int *, int);
++static int32_t tdefcolor(const int *, const char *, int *, int);
+ static void tdeftran(char);
+ static void tstrsequence(uchar);
+ 
+@@ -955,6 +974,204 @@
+ 	kill(pid, SIGHUP);
+ }
+ 
++/*
++ * Run argv[0] in dir (if not NULL), fully detached: the double fork leaves
++ * no zombie for sigchld to miss, and closing inherited descriptors keeps a
++ * long-lived child, like a browser, from holding the pty open after st
++ * exits.
++ */
++void
++spawn(const char **argv, const char *dir)
++{
++	pid_t p;
++	int fd;
++	long maxfd;
++
++	switch ((p = fork())) {
++	case -1:
++		fprintf(stderr, "fork failed: %s\n", strerror(errno));
++		return;
++	case 0:
++		if (fork() != 0)
++			_exit(0);
++		setsid();
++		maxfd = sysconf(_SC_OPEN_MAX);
++		for (fd = 3; fd < (maxfd > 0 ? MIN(maxfd, 65536) : 1024); fd++)
++			close(fd);
++		if ((fd = open("/dev/null", O_RDWR)) >= 0)
++			dup2(fd, STDIN_FILENO);
++		if (dir && chdir(dir) < 0)
++			fprintf(stderr, "st: chdir %s failed: %s\n", dir,
++			        strerror(errno));
++		execvp(argv[0], (char *const *)argv);
++		fprintf(stderr, "st: execvp %s failed: %s\n", argv[0],
++		        strerror(errno));
++		_exit(1);
++	default:
++		while (waitpid(p, NULL, 0) < 0 && errno == EINTR)
++			;
++	}
++}
++
++/*
++ * Open another st in the working directory of what runs in the foreground
++ * here: the shell, or a program it started (an editor, Claude Code, ...).
++ */
++void
++newterm(const Arg *a)
++{
++	const char *argv[] = { "st", NULL };
++	char path[32], *cwd;
++	pid_t fg = tcgetpgrp(cmdfd);
++
++	snprintf(path, sizeof(path), "/proc/%d/cwd", fg > 0 ? fg : pid);
++	if (!(cwd = realpath(path, NULL))) {
++		snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
++		cwd = realpath(path, NULL);
++	}
++	spawn(argv, cwd);
++	free(cwd);
++}
++
++int
++tisaltscr(void)
++{
++	return IS_SET(MODE_ALTSCREEN);
++}
++
++/* whether drawing is held back by a synchronized update; it expires */
++int
++tinsync(uint timeout)
++{
++	struct timespec now;
++
++	if (su) {
++		clock_gettime(CLOCK_MONOTONIC, &now);
++		if (TIMEDIFF(now, sutv) >= timeout)
++			su = 0;
++	}
++	return su;
++}
++
++/* length of the allowed scheme that s starts with, or 0 */
++static size_t
++urlscheme(const Rune *s, size_t n)
++{
++	const char **sc;
++	size_t i;
++
++	for (sc = urlschemes; *sc; sc++) {
++		for (i = 0; (*sc)[i] && i < n; i++) {
++			if (s[i] >= 128 || tolower(s[i]) != (*sc)[i])
++				break;
++		}
++		if (!(*sc)[i])
++			return i;
++	}
++	return 0;
++}
++
++static int
++isurlrune(Rune u)
++{
++	return u > ' ' && u != 0x7f && !BETWEEN(u, 0x2500, 0x259f) &&
++	       !wcschr(L"<>\"'`{}|\\^", u);
++}
++
++/*
++ * URL under the cell at (x, y) on screen, as a newly allocated string, or
++ * NULL. An OSC 8 hyperlink wins; otherwise a URL is looked for in the text,
++ * following soft-wrapped lines. Only schemes in urlschemes are returned.
++ */
++char *
++turlat(int x, int y)
++{
++	const char **sc;
++	Rune *r;
++	Glyph *gp;
++	char *uri, *s;
++	size_t n, b, e, click, i, len, open, close;
++	int yb, ye, yy, xx;
++
++	if (!BETWEEN(x, 0, term.col-1) || !BETWEEN(y, 0, term.row-1))
++		return NULL;
++	if ((TLINE(y)[x].mode & ATTR_WDUMMY) && x > 0)
++		x--;
++
++	if ((uri = linkuri(TLINE(y)[x].link))) {
++		for (sc = urlschemes; *sc; sc++) {
++			len = strlen(*sc);
++			if (!strncasecmp(uri, *sc, len) && uri[len])
++				return xstrdup(uri);
++		}
++		return NULL;
++	}
++
++	for (yb = y; yb > 0 && (TLINE(yb-1)[term.col-1].mode & ATTR_WRAP); yb--)
++		;
++	for (ye = y; ye < term.row-1 && (TLINE(ye)[term.col-1].mode & ATTR_WRAP); ye++)
++		;
++
++	r = xmalloc((ye - yb + 1) * term.col * sizeof(Rune));
++	n = click = 0;
++	for (yy = yb; yy <= ye; yy++) {
++		for (xx = 0; xx < term.col; xx++) {
++			gp = &TLINE(yy)[xx];
++			if (gp->mode & ATTR_WDUMMY)
++				continue;
++			if (yy == y && xx == x)
++				click = n;
++			r[n++] = gp->u;
++		}
++	}
++
++	uri = NULL;
++	if (!isurlrune(r[click]))
++		goto done;
++	for (b = click; b > 0 && isurlrune(r[b-1]); b--)
++		;
++	for (e = click + 1; e < n && isurlrune(r[e]); e++)
++		;
++
++	/* the scheme closest before the click starts the URL */
++	for (i = click + 1, len = 0; i-- > b;) {
++		if ((len = urlscheme(&r[i], e - i)))
++			break;
++	}
++	if (!len)
++		goto done;
++	b = i;
++
++	/* drop trailing punctuation and unbalanced closing brackets */
++	for (;;) {
++		if (e > b + len && wcschr(L".,:;!?", r[e-1])) {
++			e--;
++			continue;
++		}
++		if (e > b + len && (r[e-1] == ')' || r[e-1] == ']')) {
++			for (i = b, open = close = 0; i < e; i++) {
++				open += r[i] == (r[e-1] == ')' ? '(' : '[');
++				close += r[i] == r[e-1];
++			}
++			if (close > open) {
++				e--;
++				continue;
++			}
++		}
++		break;
++	}
++	if (e <= b + len || click >= e)
++		goto done;
++
++	uri = s = xmalloc((e - b) * UTF_SIZ + 1);
++	for (i = b; i < e; i++)
++		s += utf8encode(r[i], s);
++	*s = '\0';
++done:
++	free(r);
++	return uri;
++}
++
+ int
+ tattrset(int attr)
+ {
+@@ -1049,6 +1266,9 @@
+ tnew(int col, int row)
+ {
+ 	term = (Term){ .c = { .attr = { .fg = defaultfg, .bg = defaultbg } } };
++	LIMIT(scrollback, 1, 1000000);
++	term.hist = xmalloc(HISTSIZE * sizeof(Line));
++	memset(term.hist, 0, HISTSIZE * sizeof(Line));
+ 	tresize(col, row);
+ 	treset();
+ }
+@@ -1194,7 +1414,7 @@
+ {
+ 	char *p = csiescseq.buf, *np;
+ 	long int v;
+-	int sep = ';'; /* colon or semi-colon, but not both */
++	char sub = 0;
+ 
+ 	csiescseq.narg = 0;
+ 	if (*p == '?') {
+@@ -1210,13 +1430,12 @@
+ 			v = 0;
+ 		if (v == LONG_MAX || v == LONG_MIN)
+ 			v = -1;
++		csiescseq.sub[csiescseq.narg] = sub;
+ 		csiescseq.arg[csiescseq.narg++] = v;
+ 		p = np;
+-		if (sep == ';' && *p == ':')
+-			sep = ':'; /* allow override to colon once */
+-		if (*p != sep || csiescseq.narg == ESC_ARG_SIZ)
++		if ((*p != ';' && *p != ':') || csiescseq.narg == ESC_ARG_SIZ)
+ 			break;
+-		p++;
++		sub = *p++ == ':';
+ 	}
+ 	csiescseq.mode[0] = *p++;
+ 	csiescseq.mode[1] = (p < csiescseq.buf+csiescseq.len) ? *p : '\0';
+@@ -1310,6 +1529,9 @@
+ 			gp->fg = term.c.attr.fg;
+ 			gp->bg = term.c.attr.bg;
+ 			gp->mode = 0;
++			gp->ustyle = 0;
++			gp->ucolor = 0;
++			gp->link = 0;
+ 			gp->u = ' ';
+ 		}
+ 	}
+@@ -1364,13 +1586,19 @@
+ }
+ 
+ int32_t
+-tdefcolor(const int *attr, int *npar, int l)
++tdefcolor(const int *attr, const char *sub, int *npar, int l)
+ {
+ 	int32_t idx = -1;
+ 	uint r, g, b;
++	int n;
+ 
+ 	switch (attr[*npar + 1]) {
+ 	case 2: /* direct color in RGB space */
++		/* 38:2:<colorspace>:r:g:b carries an (ignored) colorspace id */
++		for (n = 1; *npar + n < l && sub[*npar + n]; n++)
++			;
++		if (n - 1 >= 5)
++			(*npar)++;
+ 		if (*npar + 4 >= l) {
+ 			fprintf(stderr,
+ 				"erresc(38): Incorrect number of parameters (%d)\n",
+@@ -1414,7 +1642,7 @@
+ }
+ 
+ void
+-tsetattr(const int *attr, int l)
++tsetattr(const int *attr, const char *sub, int l)
+ {
+ 	int i;
+ 	int32_t idx;
+@@ -1422,6 +1650,8 @@
+ 	for (i = 0; i < l; i++) {
+ 		switch (attr[i]) {
+ 		case 0:
++			term.c.attr.ustyle = 0;
++			term.c.attr.ucolor = 0;
+ 			term.c.attr.mode &= ~(
+ 				ATTR_BOLD       |
+ 				ATTR_FAINT      |
+@@ -1444,6 +1674,19 @@
+ 			term.c.attr.mode |= ATTR_ITALIC;
+ 			break;
+ 		case 4:
++			term.c.attr.ustyle = UL_SINGLE;
++			if (i + 1 < l && sub[i + 1]) {
++				if (!attr[++i]) {
++					term.c.attr.mode &= ~ATTR_UNDERLINE;
++					break;
++				}
++				if (BETWEEN(attr[i], UL_SINGLE, UL_DASHED))
++					term.c.attr.ustyle = attr[i];
++			}
++			term.c.attr.mode |= ATTR_UNDERLINE;
++			break;
++		case 21: /* doubly underlined */
++			term.c.attr.ustyle = UL_DOUBLE;
+ 			term.c.attr.mode |= ATTR_UNDERLINE;
+ 			break;
+ 		case 5: /* slow blink */
+@@ -1482,19 +1725,26 @@
+ 			term.c.attr.mode &= ~ATTR_STRUCK;
+ 			break;
+ 		case 38:
+-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
++			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
+ 				term.c.attr.fg = idx;
+ 			break;
+ 		case 39:
+ 			term.c.attr.fg = defaultfg;
+ 			break;
+ 		case 48:
+-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
++			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
+ 				term.c.attr.bg = idx;
+ 			break;
+ 		case 49:
+ 			term.c.attr.bg = defaultbg;
+ 			break;
++		case 58: /* underline color */
++			if ((idx = tdefcolor(attr, sub, &i, l)) >= 0)
++				term.c.attr.ucolor = idx | UCOLOR_SET;
++			break;
++		case 59:
++			term.c.attr.ucolor = 0;
++			break;
+ 		default:
+ 			if (BETWEEN(attr[i], 30, 37)) {
+ 				term.c.attr.fg = attr[i] - 30;
+@@ -1512,6 +1762,9 @@
+ 			}
+ 			break;
+ 		}
++		/* sub-parameters nobody consumed are not attributes */
++		while (i + 1 < l && sub[i + 1])
++			i++;
+ 	}
+ }
+ 
+@@ -1619,6 +1872,11 @@
+ 			case 2004: /* 2004: bracketed paste mode */
+ 				xsetmode(set, MODE_BRCKTPASTE);
+ 				break;
++			case 2026: /* 2026: synchronized updates */
++				su = set;
++				if (set)
++					clock_gettime(CLOCK_MONOTONIC, &sutv);
++				break;
+ 			/* Not implemented mouse modes. See comments there. */
+ 			case 1001: /* mouse highlight mode; can hang the
+ 				      terminal by design when implemented. */
+@@ -1836,7 +2094,16 @@
+ 		tsetmode(csiescseq.priv, 1, csiescseq.arg, csiescseq.narg);
+ 		break;
+ 	case 'm': /* SGR -- Terminal attribute (color) */
+-		tsetattr(csiescseq.arg, csiescseq.narg);
++		tsetattr(csiescseq.arg, csiescseq.sub, csiescseq.narg);
++		break;
++	case '$': /* DECRQM -- Request mode; only modes we can answer for */
++		if (csiescseq.mode[1] != 'p' || !csiescseq.priv)
++			goto unknown;
++		if (csiescseq.arg[0] == 2026) {
++			len = snprintf(buf, sizeof(buf), "\033[?2026;%d$y",
++			               su ? 1 : 2);
++			ttywrite(buf, len, 0);
++		}
+ 		break;
+ 	case 'n': /* DSR -- Device Status Report */
+ 		switch (csiescseq.arg[0]) {
+@@ -1940,6 +2207,50 @@
+ 	}
+ }
+ 
++/*
++ * OSC 8 ; params ; URI ST. The URI may itself contain ';', which strparse
++ * has split on, so it is reassembled from the remaining arguments.
++ */
++void
++oschyperlink(void)
++{
++	char *uri, *p;
++	Link *l;
++
++	if (strescseq.narg < 3 || !*strescseq.args[2]) {
++		term.c.attr.link = 0;
++		return;
++	}
++	uri = strescseq.args[2];
++	for (p = uri; p < strescseq.buf + strescseq.len; p++) {
++		if (!*p)
++			*p = ';';
++	}
++
++	/* consecutive spans of the same link share an id */
++	l = &links[lastlinkid % LINKSIZ];
++	if (lastlinkid && l->id == lastlinkid && !strcmp(l->uri, uri)) {
++		term.c.attr.link = lastlinkid;
++		return;
++	}
++	if (++lastlinkid == 0)
++		lastlinkid = 1;
++	l = &links[lastlinkid % LINKSIZ];
++	free(l->uri);
++	l->id = lastlinkid;
++	l->uri = xstrdup(uri);
++	term.c.attr.link = lastlinkid;
++}
++
++/* URI of a hyperlink id, or NULL once it has been evicted from the ring */
++char *
++linkuri(uint32_t id)
++{
++	Link *l = &links[id % LINKSIZ];
++
++	return (id && l->id == id) ? l->uri : NULL;
++}
++
+ void
+ strhandle(void)
+ {
+@@ -1972,6 +2283,9 @@
+ 			if (narg > 1)
+ 				xsettitle(strescseq.args[1]);
+ 			return;
++		case 8:
++			oschyperlink();
++			return;
+ 		case 52:
+ 			if (narg > 2 && allowwindowops) {
+ 				dec = base64dec(strescseq.args[2]);
+--- a/st.h
++++ b/st.h
+@@ -13,13 +13,17 @@
+ #define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
+ #define ATTRCMP(a, b)		(((a).mode & (~ATTR_WRAP)) != ((b).mode & (~ATTR_WRAP)) || \
+ 				(a).fg != (b).fg || \
+-				(a).bg != (b).bg)
++				(a).bg != (b).bg || \
++				(a).ustyle != (b).ustyle || \
++				(a).ucolor != (b).ucolor)
+ #define TIMEDIFF(t1, t2)	((t1.tv_sec-t2.tv_sec)*1000 + \
+ 				(t1.tv_nsec-t2.tv_nsec)/1E6)
+ #define MODBIT(x, set, bit)	((set) ? ((x) |= (bit)) : ((x) &= ~(bit)))
+ 
+ #define TRUECOLOR(r,g,b)	(1 << 24 | (r) << 16 | (g) << 8 | (b))
+ #define IS_TRUECOL(x)		(1 << 24 & (x))
++/* Glyph.ucolor holds a color like fg, flagged; 0 means "same as fg" */
++#define UCOLOR_SET		(1 << 25)
+ 
+ enum glyph_attribute {
+ 	ATTR_NULL       = 0,
+@@ -38,6 +42,15 @@
+ 	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
+ };
+ 
++/* Glyph.ustyle, meaningful while ATTR_UNDERLINE is set (SGR 4:n) */
++enum underline_style {
++	UL_SINGLE = 1,
++	UL_DOUBLE = 2,
++	UL_CURLY  = 3,
++	UL_DOTTED = 4,
++	UL_DASHED = 5,
++};
++
+ enum selection_mode {
+ 	SEL_IDLE = 0,
+ 	SEL_EMPTY = 1,
+@@ -65,8 +78,11 @@
+ typedef struct {
+ 	Rune u;           /* character code */
+ 	ushort mode;      /* attribute flags */
++	uchar ustyle;     /* underline style */
+ 	uint32_t fg;      /* foreground  */
+ 	uint32_t bg;      /* background  */
++	uint32_t link;    /* OSC 8 hyperlink id, 0 if none */
++	uint32_t ucolor;  /* underline color */
+ } Glyph;
+ 
+ typedef Glyph *Line;
+@@ -91,6 +107,11 @@
+ void toggleprinter(const Arg *);
+ 
+ int tattrset(int);
++int tisaltscr(void);
++void newterm(const Arg *);
++void spawn(const char **, const char *);
++int tinsync(uint);
++char *turlat(int, int);
+ void tnew(int, int);
+ void tresize(int, int);
+ void tsetdirtattr(int);
+@@ -136,4 +157,6 @@
+ extern unsigned int defaultfg;
+ extern unsigned int defaultbg;
+ extern unsigned int defaultcs;
++extern int scrollback;
++extern const char *urlschemes[];
+ extern const int boxdraw, boxdraw_bold, boxdraw_braille;
+--- a/x.c
++++ b/x.c
+@@ -36,8 +36,12 @@
+ 	void (*func)(const Arg *);
+ 	const Arg arg;
+ 	uint  release;
++	int  screen;
+ } MouseShortcut;
+ 
++/* which screen a mouse shortcut applies to */
++enum { S_ALL, S_PRI, S_ALT };
++
+ typedef struct {
+ 	KeySym k;
+ 	uint mask;
+@@ -162,6 +166,8 @@
+ static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
+ static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int, int);
+ static void xdrawglyph(Glyph, int, int);
++static void xdrawunderline(int, Color *, int, int, int);
++static void xdrawdashes(Color *, int, int, int, int, int);
+ static void xclear(int, int, int, int);
+ static int xgeommasktogravity(int);
+ static int ximopen(Display *);
+@@ -191,6 +197,8 @@
+ static void focus(XEvent *);
+ static uint buttonmask(uint);
+ static int mouseaction(XEvent *, uint);
++static void openurl(const char *);
++static int urlclick(XEvent *);
+ static void brelease(XEvent *);
+ static void bpress(XEvent *);
+ static void bmotion(XEvent *);
+@@ -271,6 +279,7 @@
+ static char *opt_title = NULL;
+ 
+ static uint buttons; /* bit field of pressed buttons */
++static int urlpressed; /* Button1 press was consumed by urlclick */
+ 
+ void
+ clipcopy(const Arg *dummy)
+@@ -466,13 +475,15 @@
+ mouseaction(XEvent *e, uint release)
+ {
+ 	MouseShortcut *ms;
+-
+ 	/* ignore Button<N>mask for Button<N> - it's set on release */
+ 	uint state = e->xbutton.state & ~buttonmask(e->xbutton.button);
+ 
++	int screen = tisaltscr() ? S_ALT : S_PRI;
++
+ 	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
+ 		if (ms->release == release &&
+ 		    ms->button == e->xbutton.button &&
++		    (ms->screen == S_ALL || ms->screen == screen) &&
+ 		    (match(ms->mod, state) ||  /* exact or forced */
+ 		     match(ms->mod, state & ~forcemousemod))) {
+ 			ms->func(&(ms->arg));
+@@ -484,6 +495,29 @@
+ }
+ 
+ void
++openurl(const char *url)
++{
++	const char *argv[] = { urlopener, url, NULL };
++
++	spawn(argv, NULL);
++}
++
++/* Ctrl+click (urlmod) opens a URL; works even when the app grabs the mouse */
++int
++urlclick(XEvent *e)
++{
++	char *url;
++
++	if (e->xbutton.button != Button1 || !match(urlmod, e->xbutton.state))
++		return 0;
++	if (!(url = turlat(evcol(e), evrow(e))))
++		return 0;
++	openurl(url);
++	free(url);
++	return 1;
++}
++
++void
+ bpress(XEvent *e)
+ {
+ 	int btn = e->xbutton.button;
+@@ -493,6 +527,11 @@
+ 	if (1 <= btn && btn <= 11)
+ 		buttons |= 1 << (btn-1);
+ 
++	if (urlclick(e)) {
++		urlpressed = 1;
++		return;
++	}
++
+ 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+ 		mousereport(e);
+ 		return;
+@@ -721,6 +760,12 @@
+ 	if (1 <= btn && btn <= 11)
+ 		buttons &= ~(1 << (btn-1));
+ 
++	/* the press opened a URL; its release belongs to nobody */
++	if (btn == Button1 && urlpressed) {
++		urlpressed = 0;
++		return;
++	}
++
+ 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+ 		mousereport(e);
+ 		return;
+@@ -1319,7 +1364,7 @@
+ 	FcFontSet *fcsets[] = { NULL };
+ 	FcCharSet *fccharset;
+ 	int f, code_idx, numspecs = 0;
+-	float cluster_xp = xp, cluster_yp = yp;
++	float cluster_xp, cluster_yp;
+ 	HbTransformData shaped = { 0 };
+ 
+ 	/* Initial values. */
+@@ -1444,8 +1489,8 @@
+ {
+ 	int winx = win.hborderpx + x * win.cw, winy = win.vborderpx + y * win.ch,
+ 	    width = charlen * win.cw;
+-	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg;
+-	XRenderColor colfg, colbg;
++	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg, *ul, trueul;
++	XRenderColor colfg, colbg, colul;
+ 	XRectangle r;
+ 
+ 	/* Fallback on color display for attributes not supported by the font */
+@@ -1530,6 +1575,21 @@
+ 	if (base.mode & ATTR_INVISIBLE)
+ 		fg = bg;
+ 
++	/* An underline color of its own (SGR 58), unless the text is hidden */
++	ul = fg;
++	if ((base.ucolor & UCOLOR_SET) && fg != bg) {
++		if (IS_TRUECOL(base.ucolor)) {
++			colul.alpha = 0xffff;
++			colul.red = TRUERED(base.ucolor);
++			colul.green = TRUEGREEN(base.ucolor);
++			colul.blue = TRUEBLUE(base.ucolor);
++			XftColorAllocValue(xw.dpy, xw.vis, xw.cmap, &colul, &trueul);
++			ul = &trueul;
++		} else {
++			ul = &dc.col[base.ucolor & 0xff];
++		}
++	}
++
+ 	/* Intelligent cleaning up of the borders. */
+ 	if (x == 0) {
+ 		xclear(0, (y == 0)? 0 : winy, win.vborderpx,
+@@ -1563,10 +1623,8 @@
+ 	}
+ 
+ 	/* Render underline and strikethrough. */
+-	if (base.mode & ATTR_UNDERLINE) {
+-		XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent * chscale + 1,
+-				width, 1);
+-	}
++	if (base.mode & ATTR_UNDERLINE)
++		xdrawunderline(base.ustyle, ul, winx, winy, width);
+ 
+ 	if (base.mode & ATTR_STRUCK) {
+ 		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent * chscale / 3,
+@@ -1577,6 +1635,77 @@
+ 	XftDrawSetClip(xw.draw, 0);
+ }
+ 
++/*
++ * Underline a run in one of the SGR 4:n styles. Patterns are phased to the
++ * cell grid so neighbouring runs join up, and kept inside the cell, where
++ * the clip would cut them anyway.
++ */
++void
++xdrawunderline(int style, Color *col, int winx, int winy, int width)
++{
++	int th = MAX(1, (win.ch + 8) / 20);
++	int y = winy + dc.font.ascent * chscale + 1;
++	int bottom = winy + win.ch;
++	int x, xs, gx, dy, pdy, top, h, ptop, ph, amp;
++
++	switch (style) {
++	case UL_DOUBLE:
++		y = MIN(y, bottom - 3 * th);
++		XftDrawRect(xw.draw, col, winx, y, width, th);
++		XftDrawRect(xw.draw, col, winx, y + 2 * th, width, th);
++		break;
++	case UL_CURLY:
++		/* one period of a cosine per cell, drawn as merged columns */
++		amp = MAX(2, win.ch / 8);
++		y = MIN(y, bottom - amp - th);
++		pdy = -1;
++		ptop = ph = xs = 0;
++		for (x = 0; x <= width; x++) {
++			if (x < width) {
++				gx = winx + x - win.hborderpx;
++				dy = lround(amp * (1 - cos(2 * M_PI * gx / win.cw)) / 2);
++				top = pdy < 0 ? dy : MIN(dy, pdy);
++				h = abs(dy - (pdy < 0 ? dy : pdy)) + th;
++				pdy = dy;
++				if (x > 0 && top == ptop && h == ph)
++					continue;
++			}
++			if (x > 0)
++				XftDrawRect(xw.draw, col, winx + xs, y + ptop, x - xs, ph);
++			if (x < width) {
++				xs = x;
++				ptop = top;
++				ph = h;
++			}
++		}
++		break;
++	case UL_DOTTED:
++		xdrawdashes(col, winx, MIN(y, bottom - th), width, th, th);
++		break;
++	case UL_DASHED:
++		xdrawdashes(col, winx, MIN(y, bottom - th), width, th,
++		            MAX(2, win.cw / 2));
++		break;
++	default:
++		XftDrawRect(xw.draw, col, winx, y, width, th);
++		break;
++	}
++}
++
++/* alternating on/off segments of length seg, phased to the cell grid */
++void
++xdrawdashes(Color *col, int winx, int y, int width, int th, int seg)
++{
++	int x, gx, len;
++
++	for (x = 0; x < width; x += len) {
++		gx = winx + x - win.hborderpx;
++		len = MIN(seg - gx % seg, width - x);
++		if ((gx / seg) % 2 == 0)
++			XftDrawRect(xw.draw, col, winx + x, y, len, th);
++	}
++}
++
+ void
+ xdrawglyph(Glyph g, int x, int y)
+ {
+@@ -2074,6 +2203,16 @@
+ 				continue;  /* we have time, try to find idle */
+ 		}
+ 
++		/*
++		 * The app asked us to hold drawing (mode 2026) until its frame
++		 * is complete. Keep drawing pending and check again soon; the
++		 * hold expires after su_timeout in case the end never comes.
++		 */
++		if (tinsync(su_timeout)) {
++			timeout = minlatency;
++			continue;
++		}
++
+ 		/* idle detected or maxlatency exhausted -> draw */
+ 		timeout = -1;
+ 		if (blinktimeout && tattrset(ATTR_BLINK)) {
+--- a/st.1
++++ b/st.1
+@@ -151,14 +151,48 @@
+ .B Ctrl-Shift-Home
+ Reset to default font size.
+ .TP
+-.B Ctrl-Shift-y
++.B Ctrl-=
++Increase font size.
++.TP
++.B Ctrl--
++Decrease font size.
++.TP
++.B Ctrl-0
++Reset to default font size.
++.TP
++.B Ctrl-Shift-y, Shift-Insert
+ Paste from primary selection (middle mouse button).
+ .TP
+-.B Ctrl-Shift-c
++.B Alt-c
+ Copy the selected text to the clipboard selection.
+ .TP
+-.B Ctrl-Shift-v
++.B Alt-v
+ Paste from the clipboard selection.
++.TP
++.B Shift-Up, Shift-Down
++Scroll the history by one line.
++.TP
++.B Shift-Page Up, Shift-Page Down, Ctrl-Page Up, Ctrl-Page Down, Ctrl-Up, Ctrl-Down
++Scroll the history by a page.
++.TP
++.B Ctrl-Shift-Return
++Open a new st in the working directory of the program in the foreground
++(the shell, or whatever it is running).
++.TP
++.B Ctrl-Shift-Num Lock
++Toggle the numeric keypad between application and numeric mode.
++.TP
++.B Ctrl-Click
++Open the URL under the pointer with
++.BR xdg-open (1),
++or the program set by the
++.I st.urlopener
++X resource. OSC 8 hyperlinks are used when present. This works even while an
++application has grabbed the mouse.
++.TP
++.B Mouse Wheel
++Scroll the history on the normal screen; with Shift, scroll a page. On the
++alternate screen, wheel events are sent to the application.
+ .SH CUSTOMIZATION
+ .B st
+ can be customized by creating a custom config.h and (re)compiling the source
+--- a/st.info
++++ b/st.info
+@@ -195,6 +195,10 @@
+ 	Ms=\E]52;%p1%s;%p2%s\007,
+ 	Se=\E[2 q,
+ 	Ss=\E[%p1%d q,
++	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
++# styled (SGR 4:n) and colored (SGR 58) underlines, as used by neovim
++	Smulx=\E[4\:%p1%dm,
++	Setulc=\E[58\:2\:\:%p1%{65536}%/%d\:%p1%{256}%/%{255}%&%d\:%p1%{255}%&%d%;m,
+ 
+ st| simpleterm,
+ 	use=st-mono,

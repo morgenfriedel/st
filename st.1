@@ -151,14 +151,48 @@ Decrease font size.
 .B Ctrl-Shift-Home
 Reset to default font size.
 .TP
-.B Ctrl-Shift-y
+.B Ctrl-=
+Increase font size.
+.TP
+.B Ctrl--
+Decrease font size.
+.TP
+.B Ctrl-0
+Reset to default font size.
+.TP
+.B Ctrl-Shift-y, Shift-Insert
 Paste from primary selection (middle mouse button).
 .TP
-.B Ctrl-Shift-c
+.B Alt-c
 Copy the selected text to the clipboard selection.
 .TP
-.B Ctrl-Shift-v
+.B Alt-v
 Paste from the clipboard selection.
+.TP
+.B Shift-Up, Shift-Down
+Scroll the history by one line.
+.TP
+.B Shift-Page Up, Shift-Page Down, Ctrl-Page Up, Ctrl-Page Down, Ctrl-Up, Ctrl-Down
+Scroll the history by a page.
+.TP
+.B Ctrl-Shift-Return
+Open a new st in the working directory of the program in the foreground
+(the shell, or whatever it is running).
+.TP
+.B Ctrl-Shift-Num Lock
+Toggle the numeric keypad between application and numeric mode.
+.TP
+.B Ctrl-Click
+Open the URL under the pointer with
+.BR xdg-open (1),
+or the program set by the
+.I st.urlopener
+X resource. OSC 8 hyperlinks are used when present. This works even while an
+application has grabbed the mouse.
+.TP
+.B Mouse Wheel
+Scroll the history on the normal screen; with Shift, scroll a page. On the
+alternate screen, wheel events are sent to the application.
 .SH CUSTOMIZATION
 .B st
 can be customized by creating a custom config.h and (re)compiling the source

@@ -1,8 +1,11 @@
 /* See LICENSE file for copyright and license details. */
 
 
-/* scrollback */
-static unsigned int scrollback = 10000;  // lines stored in scrollback buffer
+/*
+ * scrollback: lines of history kept. Each is allocated at full width when
+ * the window opens, so memory grows with scrollback * columns.
+ */
+int scrollback = 10000;
 
 /*
  * appearance
@@ -191,6 +194,25 @@ static unsigned int defaultattr = 11;
 static uint forcemousemod = ShiftMask;
 
 /*
+ * Clicking Button1 with urlmod held opens the URL under the pointer with
+ * urlopener (given the URL as its only argument). OSC 8 hyperlinks are used
+ * when present, otherwise URLs are found in the text. Only URLs starting
+ * with one of urlschemes are opened. This takes priority over apps that
+ * grab the mouse.
+ */
+static uint urlmod = ControlMask;
+static char *urlopener = "xdg-open";
+const char *urlschemes[] = {
+	"https://", "http://", "ftp://", "file://", "mailto:", NULL
+};
+
+/*
+ * Synchronized updates (DEC mode 2026): the longest time, in ms, to hold
+ * drawing while an app is redrawing, should it never end the update.
+ */
+static uint su_timeout = 200;
+
+/*
  * Xresources preferences to load at startup
  */
 ResourcePref resources[] = {
@@ -215,6 +237,7 @@ ResourcePref resources[] = {
 		{ "foreground",   STRING,  &colorname[257] },
 		{ "cursorColor",  STRING,  &colorname[258] },
 		{ "termname",     STRING,  &termname },
+		{ "urlopener",    STRING,  &urlopener },
 		{ "shell",        STRING,  &shell },
 		{ "minlatency",   INTEGER, &minlatency },
 		{ "maxlatency",   INTEGER, &maxlatency },
@@ -231,13 +254,21 @@ ResourcePref resources[] = {
  * Internal mouse shortcuts.
  * Beware that overloading Button1 will disable the selection.
  */
+/*
+ * screen: S_PRI applies on the normal screen (shell, with scrollback),
+ * S_ALT on the alternate screen (full-screen apps), S_ALL on both.
+ */
 static MouseShortcut mshortcuts[] = {
-	/* mask                 button   function        argument       release */
+	/* mask                 button   function        argument       release  screen */
 	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},      1 },
-	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"} },
-	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"} },
-	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"} },
-	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"} },
+	{ ShiftMask,            Button4, kscrollup,      {.i = -1},     0,       S_PRI },
+	{ ShiftMask,            Button5, kscrolldown,    {.i = -1},     0,       S_PRI },
+	{ XK_ANY_MOD,           Button4, kscrollup,      {.i = 3},      0,       S_PRI },
+	{ XK_ANY_MOD,           Button5, kscrolldown,    {.i = 3},      0,       S_PRI },
+	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"}, 0, S_ALT },
+	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"}, 0,      S_ALT },
+	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"}, 0, S_ALT },
+	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"}, 0,      S_ALT },
 };
 
 /* Internal keyboard shortcuts. */
@@ -258,6 +289,7 @@ static Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
 	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
+	{ TERMMOD,              XK_Return,      newterm,        {.i =  0} },
 	{ ShiftMask,            XK_Page_Up,     kscrollup,      {.i = -1} },
   { ShiftMask,            XK_Page_Down,   kscrolldown,    {.i = -1} },
   { ShiftMask,            XK_Up,          kscrollup,      {.i =  1} },
