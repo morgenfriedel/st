@@ -1,6 +1,6 @@
 --- a/config.def.h
 +++ b/config.def.h
-@@ -1,8 +1,11 @@
+@@ -1,15 +1,18 @@
  /* See LICENSE file for copyright and license details. */
  
  
@@ -14,6 +14,14 @@
  
  /*
   * appearance
+  *
+  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
+  */
+-static char *font = "Liberation Mono:pixelsize=14:antialias=true:autohint=true";
++static char *font = "JetBrains Mono:pixelsize=14:antialias=true:autohint=true";
+ static int borderpx = 2;
+ 
+ /*
 @@ -191,6 +194,25 @@
  static uint forcemousemod = ShiftMask;
  

@@ -17,7 +17,7 @@ Plus local changes (`patches/st-local-modern-0.9.2.diff`):
 - **Synchronized output** (DEC mode 2026, with a DECRQM reply). TUIs such as Claude Code, neovim and tmux can ask the terminal not to draw until a frame is finished, which removes tearing and flicker during redraws. A frame is held for at most `su_timeout` (200 ms).
 - **Curly and coloured underlines.** SGR `4:0`–`4:5` (none, single, double, curly, dotted, dashed), `21` (double) and `58`/`59` (underline colour), which neovim uses for diagnostics. The terminfo entry advertises them through `Smulx` and `Setulc`, so neovim picks them up once `make install` has run `tic`. Colon sub-parameters are now parsed properly; previously `4:3` came out as underline plus italic.
 - **New terminal here.** Ctrl+Shift+Enter opens another `st` in the working directory of whatever is in the foreground (the shell, or a program it started, such as neovim or Claude Code).
-- **Ligatures** (HarfBuzz). They only appear with a font that has them, such as Fira Code or JetBrains Mono; Liberation Mono, the default, has none. Set the font in `config.def.h` or with `st.font` in `~/.Xresources`.
+- **Ligatures** (HarfBuzz), with JetBrains Mono as the font (`sudo apt install fonts-jetbrains-mono`). Without it, fontconfig substitutes another monospace font, which may have no ligatures. JetBrains Mono is used rather than Fira Code because Fira Code has no italic, and `st` then draws italic text in the `defaultattr` colour instead of slanting it. A font set with `st.font` in `~/.Xresources` overrides this.
 - **Scrollback** of 10,000 lines (`scrollback` in `config.def.h`). History is allocated when a window opens, at about 2.4 KB per line per 100 columns, so 10,000 lines cost about 30 MB in a 120-column window.
 
 ## Claude Code
@@ -35,7 +35,7 @@ In that mode Claude Code turns on mouse reporting and handles selection itself; 
 All of the patches have already been applied, so you can simply clone the repository and run `sudo make clean install`. If you need to build from scratch, clone the `st` repo from suckless and then install build dependencies:
 
 ```sh
-sudo apt install build-essential libx11-dev libxft-dev libxrender-dev libharfbuzz-dev
+sudo apt install build-essential libx11-dev libxft-dev libxrender-dev libharfbuzz-dev fonts-jetbrains-mono
 ```
 
 `libharfbuzz-dev` is needed for ligatures, including when you build straight from this repository.
