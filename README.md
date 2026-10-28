@@ -20,16 +20,6 @@ Plus local changes (`patches/st-local-modern-0.9.2.diff`):
 - **Ligatures** (HarfBuzz), with JetBrains Mono as the font (`sudo apt install fonts-jetbrains-mono`). Without it, fontconfig substitutes another monospace font, which may have no ligatures. JetBrains Mono is used rather than Fira Code because Fira Code has no italic, and `st` then draws italic text in the `defaultattr` colour instead of slanting it. A font set with `st.font` in `~/.Xresources` overrides this.
 - **Scrollback** of 10,000 lines (`scrollback` in `config.def.h`). History is allocated when a window opens, at about 2.4 KB per line per 100 columns, so 10,000 lines cost about 30 MB in a 120-column window.
 
-## Claude Code
-
-Claude Code's mouse selection stays inside its own margins and skips the gutter. That comes from Claude Code's full-screen renderer, not from `st`. To get the same behaviour on another machine, set this in `~/.claude/settings.json`:
-
-```json
-{ "tui": "fullscreen" }
-```
-
-In that mode Claude Code turns on mouse reporting and handles selection itself; `st` just forwards the mouse events. To make a plain `st` selection instead (for example, across the margins), hold Shift while dragging. Ctrl+click on a URL opens it in both modes.
-
 ## Installation
 
 All of the patches have already been applied, so you can simply clone the repository and run `sudo make clean install`. If you need to build from scratch, clone the `st` repo from suckless and then install build dependencies:
