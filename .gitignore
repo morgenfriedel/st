@@ -1,0 +1,8 @@
+# build output; config.h is generated from config.def.h
+/st
+*.o
+config.h
+
+# leftovers from applying patches
+*.orig
+*.rej
