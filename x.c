@@ -199,9 +199,13 @@ static uint buttonmask(uint);
 static int mouseaction(XEvent *, uint);
 static void openurl(const char *);
 static int urlclick(XEvent *);
+static void urlhover(void);
+static void xupdatemotion(void);
 static void brelease(XEvent *);
 static void bpress(XEvent *);
 static void bmotion(XEvent *);
+static void krelease(XEvent *);
+static void leave(XEvent *);
 static void propnotify(XEvent *);
 static void selnotify(XEvent *);
 static void selclear_(XEvent *);
@@ -217,6 +221,8 @@ static void usage(void);
 
 static void (*handler[LASTEvent])(XEvent *) = {
 	[KeyPress] = kpress,
+	[KeyRelease] = krelease,
+	[LeaveNotify] = leave,
 	[ClientMessage] = cmessage,
 	[ConfigureNotify] = resize,
 	[VisibilityNotify] = visibility,
@@ -280,6 +286,9 @@ static char *opt_title = NULL;
 
 static uint buttons; /* bit field of pressed buttons */
 static int urlpressed; /* Button1 press was consumed by urlclick */
+static int urlhovering; /* urlmod is held with the pointer in the window */
+static int appmotion; /* the app asked for motion reports without buttons */
+static Cursor textcursor, linkcursor;
 
 void
 clipcopy(const Arg *dummy)
@@ -515,6 +524,38 @@ urlclick(XEvent *e)
 	openurl(url);
 	free(url);
 	return 1;
+}
+
+/*
+ * With urlmod held, the URL under the pointer is underlined and the pointer
+ * becomes a hand. Called when a modifier key goes down or up, the pointer
+ * moves, or the window loses the pointer or focus.
+ */
+void
+urlhover(void)
+{
+	Window root, child;
+	int rx, ry, x, y, on;
+	uint mask;
+
+	on = IS_SET(MODE_FOCUSED) &&
+	     XQueryPointer(xw.dpy, xw.win, &root, &child, &rx, &ry, &x, &y, &mask) &&
+	     BETWEEN(x, 0, win.w - 1) && BETWEEN(y, 0, win.h - 1) &&
+	     match(urlmod, mask & ~(Button1Mask | Button2Mask | Button3Mask |
+	                            Button4Mask | Button5Mask));
+	if (on) {
+		x -= win.hborderpx;
+		y -= win.vborderpx;
+		LIMIT(x, 0, win.tw - 1);
+		LIMIT(y, 0, win.th - 1);
+		turlhover(x / win.cw, y / win.ch);
+	} else {
+		turlhover(-1, -1);
+	}
+	if (on != urlhovering) {
+		urlhovering = on;
+		xupdatemotion();
+	}
 }
 
 void
@@ -780,6 +821,9 @@ brelease(XEvent *e)
 void
 bmotion(XEvent *e)
 {
+	if (urlhovering)
+		urlhover();
+
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
@@ -1210,7 +1254,6 @@ void
 xinit(int cols, int rows)
 {
 	XGCValues gcvalues;
-	Cursor cursor;
 	Window parent, root;
 	pid_t thispid = getpid();
 	XColor xmousefg, xmousebg;
@@ -1257,7 +1300,8 @@ xinit(int cols, int rows)
 	xw.attrs.bit_gravity = NorthWestGravity;
 	xw.attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask
 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
-		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
+		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask
+		| LeaveWindowMask;
 	xw.attrs.colormap = xw.cmap;
 
 	xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t,
@@ -1289,8 +1333,9 @@ xinit(int cols, int rows)
 	}
 
 	/* white cursor, black outline */
-	cursor = XCreateFontCursor(xw.dpy, mouseshape);
-	XDefineCursor(xw.dpy, xw.win, cursor);
+	textcursor = XCreateFontCursor(xw.dpy, mouseshape);
+	linkcursor = XCreateFontCursor(xw.dpy, XC_hand2);
+	XDefineCursor(xw.dpy, xw.win, textcursor);
 
 	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
 		xmousefg.red   = 0xffff;
@@ -1304,7 +1349,8 @@ xinit(int cols, int rows)
 		xmousebg.blue  = 0x0000;
 	}
 
-	XRecolorCursor(xw.dpy, cursor, &xmousefg, &xmousebg);
+	XRecolorCursor(xw.dpy, textcursor, &xmousefg, &xmousebg);
+	XRecolorCursor(xw.dpy, linkcursor, &xmousefg, &xmousebg);
 
 	xw.xembed = XInternAtom(xw.dpy, "_XEMBED", False);
 	xw.wmdeletewin = XInternAtom(xw.dpy, "WM_DELETE_WINDOW", False);
@@ -1868,6 +1914,10 @@ xdrawline(Line line, int x1, int y1, int x2)
 			continue;
 		if (selected(x, y1))
 			new.mode ^= ATTR_REVERSE;
+		if (turlhovered(x, y1)) {
+			new.mode |= ATTR_UNDERLINE;
+			new.ustyle = UL_SINGLE;
+		}
 		if ((i > 0) && ATTRCMP(base, new)) {
 			numspecs = xmakeglyphfontspecs(specs, &line[ox], x - ox, ox, y1);
 			xdrawglyphfontspecs(specs, base, numspecs, ox, y1, x - ox);
@@ -1930,8 +1980,27 @@ unmap(XEvent *ev)
 void
 xsetpointermotion(int set)
 {
-	MODBIT(xw.attrs.event_mask, set, PointerMotionMask);
+	appmotion = set;
+	xupdatemotion();
+}
+
+/* motion without buttons is wanted by the app, or to track a URL hover */
+void
+xupdatemotion(void)
+{
+	MODBIT(xw.attrs.event_mask, appmotion || urlhovering, PointerMotionMask);
 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
+}
+
+void
+xsetpointerlink(int set)
+{
+	static int link;
+
+	if (set == link)
+		return;
+	link = set;
+	XDefineCursor(xw.dpy, xw.win, set ? linkcursor : textcursor);
 }
 
 void
@@ -1993,6 +2062,14 @@ focus(XEvent *ev)
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[O", 3, 0);
 	}
+	urlhover();
+}
+
+void
+leave(XEvent *ev)
+{
+	if (urlhovering)
+		urlhover();
 }
 
 int
@@ -2039,6 +2116,13 @@ kmap(KeySym k, uint state)
 }
 
 void
+krelease(XEvent *ev)
+{
+	if (IsModifierKey(XLookupKeysym(&ev->xkey, 0)))
+		urlhover();
+}
+
+void
 kpress(XEvent *ev)
 {
 	XKeyEvent *e = &ev->xkey;
@@ -2048,6 +2132,9 @@ kpress(XEvent *ev)
 	Rune c;
 	Status status;
 	Shortcut *bp;
+
+	if (IsModifierKey(XLookupKeysym(e, 0)))
+		urlhover();
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;

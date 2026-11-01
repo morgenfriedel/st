@@ -198,7 +198,8 @@ static uint forcemousemod = ShiftMask;
  * urlopener (given the URL as its only argument). OSC 8 hyperlinks are used
  * when present, otherwise URLs are found in the text. Only URLs starting
  * with one of urlschemes are opened. This takes priority over apps that
- * grab the mouse.
+ * grab the mouse. While urlmod is held, the URL under the pointer is
+ * underlined and the pointer becomes a hand.
  */
 static uint urlmod = ControlMask;
 static char *urlopener = "xdg-open";

@@ -22,7 +22,7 @@
  static int borderpx = 2;
  
  /*
-@@ -191,6 +194,25 @@
+@@ -191,6 +194,26 @@
  static uint forcemousemod = ShiftMask;
  
  /*
@@ -30,7 +30,8 @@
 + * urlopener (given the URL as its only argument). OSC 8 hyperlinks are used
 + * when present, otherwise URLs are found in the text. Only URLs starting
 + * with one of urlschemes are opened. This takes priority over apps that
-+ * grab the mouse.
++ * grab the mouse. While urlmod is held, the URL under the pointer is
++ * underlined and the pointer becomes a hand.
 + */
 +static uint urlmod = ControlMask;
 +static char *urlopener = "xdg-open";
@@ -48,7 +49,7 @@
   * Xresources preferences to load at startup
   */
  ResourcePref resources[] = {
-@@ -215,6 +237,7 @@
+@@ -215,6 +238,7 @@
  		{ "foreground",   STRING,  &colorname[257] },
  		{ "cursorColor",  STRING,  &colorname[258] },
  		{ "termname",     STRING,  &termname },
@@ -56,7 +57,7 @@
  		{ "shell",        STRING,  &shell },
  		{ "minlatency",   INTEGER, &minlatency },
  		{ "maxlatency",   INTEGER, &maxlatency },
-@@ -231,13 +254,21 @@
+@@ -231,13 +255,21 @@
   * Internal mouse shortcuts.
   * Beware that overloading Button1 will disable the selection.
   */
@@ -83,7 +84,7 @@
  };
  
  /* Internal keyboard shortcuts. */
-@@ -258,6 +289,7 @@
+@@ -258,6 +290,7 @@
  	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
  	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
  	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
@@ -155,16 +156,24 @@
  static void execsh(char *, char **);
  static void stty(char **);
  static void sigchld(int);
-@@ -172,6 +189,8 @@
+@@ -172,6 +189,16 @@
  static int eschandle(uchar);
  static void strdump(void);
  static void strhandle(void);
 +static void oschyperlink(void);
 +static char *linkuri(uint32_t);
++static void urlhoverupdate(void);
++
++/* URL hover: pointer cell, and the cells of the URL found there */
++static struct {
++	int x, y;
++	int span[2];
++	int col;
++} hover = { .x = -1 };
  static void strparse(void);
  static void strreset(void);
  
-@@ -194,7 +213,7 @@
+@@ -194,7 +221,7 @@
  static void treset(void);
  static void tscrollup(int, int, int);
  static void tscrolldown(int, int, int);
@@ -173,7 +182,7 @@
  static void tsetchar(Rune, const Glyph *, int, int);
  static void tsetdirt(int, int);
  static void tsetscroll(int, int);
-@@ -205,7 +224,7 @@
+@@ -205,7 +232,7 @@
  static void tcontrolcode(uchar );
  static void tdectest(char );
  static void tdefutf8(char);
@@ -182,7 +191,7 @@
  static void tdeftran(char);
  static void tstrsequence(uchar);
  
-@@ -955,6 +974,204 @@
+@@ -955,6 +982,275 @@
  	kill(pid, SIGHUP);
  }
  
@@ -294,29 +303,44 @@
 + * URL under the cell at (x, y) on screen, as a newly allocated string, or
 + * NULL. An OSC 8 hyperlink wins; otherwise a URL is looked for in the text,
 + * following soft-wrapped lines. Only schemes in urlschemes are returned.
++ * The cells it covers are stored in *span as screen positions
++ * y * term.col + x, from span[0] up to but not including span[1].
 + */
-+char *
-+turlat(int x, int y)
++static char *
++urlspan(int x, int y, int *span)
 +{
 +	const char **sc;
 +	Rune *r;
 +	Glyph *gp;
 +	char *uri, *s;
 +	size_t n, b, e, click, i, len, open, close;
-+	int yb, ye, yy, xx;
++	int yb, ye, yy, xx, *pos, p;
++	uint32_t id;
 +
 +	if (!BETWEEN(x, 0, term.col-1) || !BETWEEN(y, 0, term.row-1))
 +		return NULL;
 +	if ((TLINE(y)[x].mode & ATTR_WDUMMY) && x > 0)
 +		x--;
 +
-+	if ((uri = linkuri(TLINE(y)[x].link))) {
++	id = TLINE(y)[x].link;
++	if ((uri = linkuri(id))) {
 +		for (sc = urlschemes; *sc; sc++) {
 +			len = strlen(*sc);
 +			if (!strncasecmp(uri, *sc, len) && uri[len])
-+				return xstrdup(uri);
++				break;
 +		}
-+		return NULL;
++		if (!*sc)
++			return NULL;
++		p = y * term.col + x;
++		for (span[0] = p; span[0] > 0 &&
++		     TLINE((span[0]-1) / term.col)[(span[0]-1) % term.col].link == id;
++		     span[0]--)
++			;
++		for (span[1] = p + 1; span[1] < term.row * term.col &&
++		     TLINE(span[1] / term.col)[span[1] % term.col].link == id;
++		     span[1]++)
++			;
++		return xstrdup(uri);
 +	}
 +
 +	for (yb = y; yb > 0 && (TLINE(yb-1)[term.col-1].mode & ATTR_WRAP); yb--)
@@ -325,6 +349,7 @@
 +		;
 +
 +	r = xmalloc((ye - yb + 1) * term.col * sizeof(Rune));
++	pos = xmalloc((ye - yb + 1) * term.col * sizeof(int));
 +	n = click = 0;
 +	for (yy = yb; yy <= ye; yy++) {
 +		for (xx = 0; xx < term.col; xx++) {
@@ -333,6 +358,7 @@
 +				continue;
 +			if (yy == y && xx == x)
 +				click = n;
++			pos[n] = yy * term.col + xx;
 +			r[n++] = gp->u;
 +		}
 +	}
@@ -379,15 +405,69 @@
 +	for (i = b; i < e; i++)
 +		s += utf8encode(r[i], s);
 +	*s = '\0';
++	span[0] = pos[b];
++	span[1] = pos[e-1] + 1;
 +done:
 +	free(r);
++	free(pos);
 +	return uri;
++}
++
++char *
++turlat(int x, int y)
++{
++	int span[2];
++
++	return urlspan(x, y, span);
++}
++
++/*
++ * Cell under the pointer while urlmod is held, or x < 0. draw() underlines
++ * the URL there, if any.
++ */
++void
++turlhover(int x, int y)
++{
++	hover.x = x;
++	hover.y = y;
++}
++
++int
++turlhovered(int x, int y)
++{
++	return BETWEEN(y * term.col + x, hover.span[0], hover.span[1] - 1);
++}
++
++/* find the URL under the pointer again, as the screen may have changed */
++static void
++urlhoverupdate(void)
++{
++	int span[2] = {0, 0}, found = 0;
++	char *url;
++
++	if (hover.x >= 0 && (url = urlspan(hover.x, hover.y, span))) {
++		found = 1;
++		free(url);
++	} else {
++		span[0] = span[1] = 0;
++	}
++	if (span[0] == hover.span[0] && span[1] == hover.span[1] &&
++	    hover.col == term.col)
++		return;
++	if (hover.span[1] > 0 && hover.col == term.col)
++		tsetdirt(hover.span[0] / term.col, (hover.span[1] - 1) / term.col);
++	if (found)
++		tsetdirt(span[0] / term.col, (span[1] - 1) / term.col);
++	hover.span[0] = span[0];
++	hover.span[1] = span[1];
++	hover.col = term.col;
++	xsetpointerlink(found);
 +}
 +
  int
  tattrset(int attr)
  {
-@@ -1049,6 +1266,9 @@
+@@ -1049,6 +1345,9 @@
  tnew(int col, int row)
  {
  	term = (Term){ .c = { .attr = { .fg = defaultfg, .bg = defaultbg } } };
@@ -397,7 +477,7 @@
  	tresize(col, row);
  	treset();
  }
-@@ -1194,7 +1414,7 @@
+@@ -1194,7 +1493,7 @@
  {
  	char *p = csiescseq.buf, *np;
  	long int v;
@@ -406,7 +486,7 @@
  
  	csiescseq.narg = 0;
  	if (*p == '?') {
-@@ -1210,13 +1430,12 @@
+@@ -1210,13 +1509,12 @@
  			v = 0;
  		if (v == LONG_MAX || v == LONG_MIN)
  			v = -1;
@@ -423,7 +503,7 @@
  	}
  	csiescseq.mode[0] = *p++;
  	csiescseq.mode[1] = (p < csiescseq.buf+csiescseq.len) ? *p : '\0';
-@@ -1310,6 +1529,9 @@
+@@ -1310,6 +1608,9 @@
  			gp->fg = term.c.attr.fg;
  			gp->bg = term.c.attr.bg;
  			gp->mode = 0;
@@ -433,7 +513,7 @@
  			gp->u = ' ';
  		}
  	}
-@@ -1364,13 +1586,19 @@
+@@ -1364,13 +1665,19 @@
  }
  
  int32_t
@@ -454,7 +534,7 @@
  		if (*npar + 4 >= l) {
  			fprintf(stderr,
  				"erresc(38): Incorrect number of parameters (%d)\n",
-@@ -1414,7 +1642,7 @@
+@@ -1414,7 +1721,7 @@
  }
  
  void
@@ -463,7 +543,7 @@
  {
  	int i;
  	int32_t idx;
-@@ -1422,6 +1650,8 @@
+@@ -1422,6 +1729,8 @@
  	for (i = 0; i < l; i++) {
  		switch (attr[i]) {
  		case 0:
@@ -472,7 +552,7 @@
  			term.c.attr.mode &= ~(
  				ATTR_BOLD       |
  				ATTR_FAINT      |
-@@ -1444,6 +1674,19 @@
+@@ -1444,6 +1753,19 @@
  			term.c.attr.mode |= ATTR_ITALIC;
  			break;
  		case 4:
@@ -492,7 +572,7 @@
  			term.c.attr.mode |= ATTR_UNDERLINE;
  			break;
  		case 5: /* slow blink */
-@@ -1482,19 +1725,26 @@
+@@ -1482,19 +1804,26 @@
  			term.c.attr.mode &= ~ATTR_STRUCK;
  			break;
  		case 38:
@@ -521,7 +601,7 @@
  		default:
  			if (BETWEEN(attr[i], 30, 37)) {
  				term.c.attr.fg = attr[i] - 30;
-@@ -1512,6 +1762,9 @@
+@@ -1512,6 +1841,9 @@
  			}
  			break;
  		}
@@ -531,7 +611,7 @@
  	}
  }
  
-@@ -1619,6 +1872,11 @@
+@@ -1619,6 +1951,11 @@
  			case 2004: /* 2004: bracketed paste mode */
  				xsetmode(set, MODE_BRCKTPASTE);
  				break;
@@ -543,7 +623,7 @@
  			/* Not implemented mouse modes. See comments there. */
  			case 1001: /* mouse highlight mode; can hang the
  				      terminal by design when implemented. */
-@@ -1836,7 +2094,16 @@
+@@ -1836,7 +2173,16 @@
  		tsetmode(csiescseq.priv, 1, csiescseq.arg, csiescseq.narg);
  		break;
  	case 'm': /* SGR -- Terminal attribute (color) */
@@ -561,7 +641,7 @@
  		break;
  	case 'n': /* DSR -- Device Status Report */
  		switch (csiescseq.arg[0]) {
-@@ -1940,6 +2207,50 @@
+@@ -1940,6 +2286,50 @@
  	}
  }
  
@@ -612,7 +692,7 @@
  void
  strhandle(void)
  {
-@@ -1972,6 +2283,9 @@
+@@ -1972,6 +2362,9 @@
  			if (narg > 1)
  				xsettitle(strescseq.args[1]);
  			return;
@@ -622,6 +702,14 @@
  		case 52:
  			if (narg > 2 && allowwindowops) {
  				dec = base64dec(strescseq.args[2]);
+@@ -2737,6 +3130,7 @@
+ 	if (term.line[term.c.y][cx].mode & ATTR_WDUMMY)
+ 		cx--;
+ 
++	urlhoverupdate();
+ 	drawregion(0, 0, term.col, term.row);
+ 	if (term.scr == 0)
+ 		xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
 --- a/st.h
 +++ b/st.h
 @@ -13,13 +13,17 @@
@@ -671,7 +759,7 @@
  } Glyph;
  
  typedef Glyph *Line;
-@@ -91,6 +107,11 @@
+@@ -91,6 +107,13 @@
  void toggleprinter(const Arg *);
  
  int tattrset(int);
@@ -680,16 +768,28 @@
 +void spawn(const char **, const char *);
 +int tinsync(uint);
 +char *turlat(int, int);
++void turlhover(int, int);
++int turlhovered(int, int);
  void tnew(int, int);
  void tresize(int, int);
  void tsetdirtattr(int);
-@@ -136,4 +157,6 @@
+@@ -136,4 +159,6 @@
  extern unsigned int defaultfg;
  extern unsigned int defaultbg;
  extern unsigned int defaultcs;
 +extern int scrollback;
 +extern const char *urlschemes[];
  extern const int boxdraw, boxdraw_bold, boxdraw_braille;
+--- a/win.h
++++ b/win.h
+@@ -36,6 +36,7 @@
+ int xsetcursor(int);
+ void xsetmode(int, unsigned int);
+ void xsetpointermotion(int);
++void xsetpointerlink(int);
+ void xsetsel(char *);
+ int xstartdraw(void);
+ void xximspot(int, int);
 --- a/x.c
 +++ b/x.c
 @@ -36,8 +36,12 @@
@@ -714,24 +814,43 @@
  static void xclear(int, int, int, int);
  static int xgeommasktogravity(int);
  static int ximopen(Display *);
-@@ -191,6 +197,8 @@
+@@ -191,9 +197,15 @@
  static void focus(XEvent *);
  static uint buttonmask(uint);
  static int mouseaction(XEvent *, uint);
 +static void openurl(const char *);
 +static int urlclick(XEvent *);
++static void urlhover(void);
++static void xupdatemotion(void);
  static void brelease(XEvent *);
  static void bpress(XEvent *);
  static void bmotion(XEvent *);
-@@ -271,6 +279,7 @@
++static void krelease(XEvent *);
++static void leave(XEvent *);
+ static void propnotify(XEvent *);
+ static void selnotify(XEvent *);
+ static void selclear_(XEvent *);
+@@ -209,6 +221,8 @@
+ 
+ static void (*handler[LASTEvent])(XEvent *) = {
+ 	[KeyPress] = kpress,
++	[KeyRelease] = krelease,
++	[LeaveNotify] = leave,
+ 	[ClientMessage] = cmessage,
+ 	[ConfigureNotify] = resize,
+ 	[VisibilityNotify] = visibility,
+@@ -271,6 +285,10 @@
  static char *opt_title = NULL;
  
  static uint buttons; /* bit field of pressed buttons */
 +static int urlpressed; /* Button1 press was consumed by urlclick */
++static int urlhovering; /* urlmod is held with the pointer in the window */
++static int appmotion; /* the app asked for motion reports without buttons */
++static Cursor textcursor, linkcursor;
  
  void
  clipcopy(const Arg *dummy)
-@@ -466,13 +475,15 @@
+@@ -466,13 +484,15 @@
  mouseaction(XEvent *e, uint release)
  {
  	MouseShortcut *ms;
@@ -748,7 +867,7 @@
  		    (match(ms->mod, state) ||  /* exact or forced */
  		     match(ms->mod, state & ~forcemousemod))) {
  			ms->func(&(ms->arg));
-@@ -484,6 +495,29 @@
+@@ -484,6 +504,61 @@
  }
  
  void
@@ -774,11 +893,43 @@
 +	return 1;
 +}
 +
++/*
++ * With urlmod held, the URL under the pointer is underlined and the pointer
++ * becomes a hand. Called when a modifier key goes down or up, the pointer
++ * moves, or the window loses the pointer or focus.
++ */
++void
++urlhover(void)
++{
++	Window root, child;
++	int rx, ry, x, y, on;
++	uint mask;
++
++	on = IS_SET(MODE_FOCUSED) &&
++	     XQueryPointer(xw.dpy, xw.win, &root, &child, &rx, &ry, &x, &y, &mask) &&
++	     BETWEEN(x, 0, win.w - 1) && BETWEEN(y, 0, win.h - 1) &&
++	     match(urlmod, mask & ~(Button1Mask | Button2Mask | Button3Mask |
++	                            Button4Mask | Button5Mask));
++	if (on) {
++		x -= win.hborderpx;
++		y -= win.vborderpx;
++		LIMIT(x, 0, win.tw - 1);
++		LIMIT(y, 0, win.th - 1);
++		turlhover(x / win.cw, y / win.ch);
++	} else {
++		turlhover(-1, -1);
++	}
++	if (on != urlhovering) {
++		urlhovering = on;
++		xupdatemotion();
++	}
++}
++
 +void
  bpress(XEvent *e)
  {
  	int btn = e->xbutton.button;
-@@ -493,6 +527,11 @@
+@@ -493,6 +568,11 @@
  	if (1 <= btn && btn <= 11)
  		buttons |= 1 << (btn-1);
  
@@ -790,7 +941,7 @@
  	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
  		mousereport(e);
  		return;
-@@ -721,6 +760,12 @@
+@@ -721,6 +801,12 @@
  	if (1 <= btn && btn <= 11)
  		buttons &= ~(1 << (btn-1));
  
@@ -803,7 +954,57 @@
  	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
  		mousereport(e);
  		return;
-@@ -1319,7 +1364,7 @@
+@@ -735,6 +821,9 @@
+ void
+ bmotion(XEvent *e)
+ {
++	if (urlhovering)
++		urlhover();
++
+ 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+ 		mousereport(e);
+ 		return;
+@@ -1165,7 +1254,6 @@
+ xinit(int cols, int rows)
+ {
+ 	XGCValues gcvalues;
+-	Cursor cursor;
+ 	Window parent, root;
+ 	pid_t thispid = getpid();
+ 	XColor xmousefg, xmousebg;
+@@ -1212,7 +1300,8 @@
+ 	xw.attrs.bit_gravity = NorthWestGravity;
+ 	xw.attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask
+ 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
+-		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
++		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask
++		| LeaveWindowMask;
+ 	xw.attrs.colormap = xw.cmap;
+ 
+ 	xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t,
+@@ -1244,8 +1333,9 @@
+ 	}
+ 
+ 	/* white cursor, black outline */
+-	cursor = XCreateFontCursor(xw.dpy, mouseshape);
+-	XDefineCursor(xw.dpy, xw.win, cursor);
++	textcursor = XCreateFontCursor(xw.dpy, mouseshape);
++	linkcursor = XCreateFontCursor(xw.dpy, XC_hand2);
++	XDefineCursor(xw.dpy, xw.win, textcursor);
+ 
+ 	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
+ 		xmousefg.red   = 0xffff;
+@@ -1259,7 +1349,8 @@
+ 		xmousebg.blue  = 0x0000;
+ 	}
+ 
+-	XRecolorCursor(xw.dpy, cursor, &xmousefg, &xmousebg);
++	XRecolorCursor(xw.dpy, textcursor, &xmousefg, &xmousebg);
++	XRecolorCursor(xw.dpy, linkcursor, &xmousefg, &xmousebg);
+ 
+ 	xw.xembed = XInternAtom(xw.dpy, "_XEMBED", False);
+ 	xw.wmdeletewin = XInternAtom(xw.dpy, "WM_DELETE_WINDOW", False);
+@@ -1319,7 +1410,7 @@
  	FcFontSet *fcsets[] = { NULL };
  	FcCharSet *fccharset;
  	int f, code_idx, numspecs = 0;
@@ -812,7 +1013,7 @@
  	HbTransformData shaped = { 0 };
  
  	/* Initial values. */
-@@ -1444,8 +1489,8 @@
+@@ -1444,8 +1535,8 @@
  {
  	int winx = win.hborderpx + x * win.cw, winy = win.vborderpx + y * win.ch,
  	    width = charlen * win.cw;
@@ -823,7 +1024,7 @@
  	XRectangle r;
  
  	/* Fallback on color display for attributes not supported by the font */
-@@ -1530,6 +1575,21 @@
+@@ -1530,6 +1621,21 @@
  	if (base.mode & ATTR_INVISIBLE)
  		fg = bg;
  
@@ -845,7 +1046,7 @@
  	/* Intelligent cleaning up of the borders. */
  	if (x == 0) {
  		xclear(0, (y == 0)? 0 : winy, win.vborderpx,
-@@ -1563,10 +1623,8 @@
+@@ -1563,10 +1669,8 @@
  	}
  
  	/* Render underline and strikethrough. */
@@ -858,7 +1059,7 @@
  
  	if (base.mode & ATTR_STRUCK) {
  		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent * chscale / 3,
-@@ -1577,6 +1635,77 @@
+@@ -1577,6 +1681,77 @@
  	XftDrawSetClip(xw.draw, 0);
  }
  
@@ -936,7 +1137,89 @@
  void
  xdrawglyph(Glyph g, int x, int y)
  {
-@@ -2074,6 +2203,16 @@
+@@ -1739,6 +1914,10 @@
+ 			continue;
+ 		if (selected(x, y1))
+ 			new.mode ^= ATTR_REVERSE;
++		if (turlhovered(x, y1)) {
++			new.mode |= ATTR_UNDERLINE;
++			new.ustyle = UL_SINGLE;
++		}
+ 		if ((i > 0) && ATTRCMP(base, new)) {
+ 			numspecs = xmakeglyphfontspecs(specs, &line[ox], x - ox, ox, y1);
+ 			xdrawglyphfontspecs(specs, base, numspecs, ox, y1, x - ox);
+@@ -1801,11 +1980,30 @@
+ void
+ xsetpointermotion(int set)
+ {
+-	MODBIT(xw.attrs.event_mask, set, PointerMotionMask);
++	appmotion = set;
++	xupdatemotion();
++}
++
++/* motion without buttons is wanted by the app, or to track a URL hover */
++void
++xupdatemotion(void)
++{
++	MODBIT(xw.attrs.event_mask, appmotion || urlhovering, PointerMotionMask);
+ 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
+ }
+ 
+ void
++xsetpointerlink(int set)
++{
++	static int link;
++
++	if (set == link)
++		return;
++	link = set;
++	XDefineCursor(xw.dpy, xw.win, set ? linkcursor : textcursor);
++}
++
++void
+ xsetmode(int set, unsigned int flags)
+ {
+ 	int mode = win.mode;
+@@ -1864,6 +2062,14 @@
+ 		if (IS_SET(MODE_FOCUS))
+ 			ttywrite("\033[O", 3, 0);
+ 	}
++	urlhover();
++}
++
++void
++leave(XEvent *ev)
++{
++	if (urlhovering)
++		urlhover();
+ }
+ 
+ int
+@@ -1910,6 +2116,13 @@
+ }
+ 
+ void
++krelease(XEvent *ev)
++{
++	if (IsModifierKey(XLookupKeysym(&ev->xkey, 0)))
++		urlhover();
++}
++
++void
+ kpress(XEvent *ev)
+ {
+ 	XKeyEvent *e = &ev->xkey;
+@@ -1920,6 +2133,9 @@
+ 	Status status;
+ 	Shortcut *bp;
+ 
++	if (IsModifierKey(XLookupKeysym(e, 0)))
++		urlhover();
++
+ 	if (IS_SET(MODE_KBDLOCK))
+ 		return;
+ 
+@@ -2074,6 +2290,16 @@
  				continue;  /* we have time, try to find idle */
  		}
  
@@ -955,7 +1238,7 @@
  		if (blinktimeout && tattrset(ATTR_BLINK)) {
 --- a/st.1
 +++ b/st.1
-@@ -151,14 +151,48 @@
+@@ -151,14 +151,49 @@
  .B Ctrl-Shift-Home
  Reset to default font size.
  .TP
@@ -998,7 +1281,8 @@
 +.BR xdg-open (1),
 +or the program set by the
 +.I st.urlopener
-+X resource. OSC 8 hyperlinks are used when present. This works even while an
++X resource. While Ctrl is held, the URL under the pointer is underlined and
++the pointer becomes a hand. OSC 8 hyperlinks are used when present. This works even while an
 +application has grabbed the mouse.
 +.TP
 +.B Mouse Wheel

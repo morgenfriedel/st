@@ -112,6 +112,8 @@ void newterm(const Arg *);
 void spawn(const char **, const char *);
 int tinsync(uint);
 char *turlat(int, int);
+void turlhover(int, int);
+int turlhovered(int, int);
 void tnew(int, int);
 void tresize(int, int);
 void tsetdirtattr(int);

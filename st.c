@@ -191,6 +191,14 @@ static void strdump(void);
 static void strhandle(void);
 static void oschyperlink(void);
 static char *linkuri(uint32_t);
+static void urlhoverupdate(void);
+
+/* URL hover: pointer cell, and the cells of the URL found there */
+static struct {
+	int x, y;
+	int span[2];
+	int col;
+} hover = { .x = -1 };
 static void strparse(void);
 static void strreset(void);
 
@@ -1082,29 +1090,44 @@ isurlrune(Rune u)
  * URL under the cell at (x, y) on screen, as a newly allocated string, or
  * NULL. An OSC 8 hyperlink wins; otherwise a URL is looked for in the text,
  * following soft-wrapped lines. Only schemes in urlschemes are returned.
+ * The cells it covers are stored in *span as screen positions
+ * y * term.col + x, from span[0] up to but not including span[1].
  */
-char *
-turlat(int x, int y)
+static char *
+urlspan(int x, int y, int *span)
 {
 	const char **sc;
 	Rune *r;
 	Glyph *gp;
 	char *uri, *s;
 	size_t n, b, e, click, i, len, open, close;
-	int yb, ye, yy, xx;
+	int yb, ye, yy, xx, *pos, p;
+	uint32_t id;
 
 	if (!BETWEEN(x, 0, term.col-1) || !BETWEEN(y, 0, term.row-1))
 		return NULL;
 	if ((TLINE(y)[x].mode & ATTR_WDUMMY) && x > 0)
 		x--;
 
-	if ((uri = linkuri(TLINE(y)[x].link))) {
+	id = TLINE(y)[x].link;
+	if ((uri = linkuri(id))) {
 		for (sc = urlschemes; *sc; sc++) {
 			len = strlen(*sc);
 			if (!strncasecmp(uri, *sc, len) && uri[len])
-				return xstrdup(uri);
+				break;
 		}
-		return NULL;
+		if (!*sc)
+			return NULL;
+		p = y * term.col + x;
+		for (span[0] = p; span[0] > 0 &&
+		     TLINE((span[0]-1) / term.col)[(span[0]-1) % term.col].link == id;
+		     span[0]--)
+			;
+		for (span[1] = p + 1; span[1] < term.row * term.col &&
+		     TLINE(span[1] / term.col)[span[1] % term.col].link == id;
+		     span[1]++)
+			;
+		return xstrdup(uri);
 	}
 
 	for (yb = y; yb > 0 && (TLINE(yb-1)[term.col-1].mode & ATTR_WRAP); yb--)
@@ -1113,6 +1136,7 @@ turlat(int x, int y)
 		;
 
 	r = xmalloc((ye - yb + 1) * term.col * sizeof(Rune));
+	pos = xmalloc((ye - yb + 1) * term.col * sizeof(int));
 	n = click = 0;
 	for (yy = yb; yy <= ye; yy++) {
 		for (xx = 0; xx < term.col; xx++) {
@@ -1121,6 +1145,7 @@ turlat(int x, int y)
 				continue;
 			if (yy == y && xx == x)
 				click = n;
+			pos[n] = yy * term.col + xx;
 			r[n++] = gp->u;
 		}
 	}
@@ -1167,9 +1192,63 @@ turlat(int x, int y)
 	for (i = b; i < e; i++)
 		s += utf8encode(r[i], s);
 	*s = '\0';
+	span[0] = pos[b];
+	span[1] = pos[e-1] + 1;
 done:
 	free(r);
+	free(pos);
 	return uri;
+}
+
+char *
+turlat(int x, int y)
+{
+	int span[2];
+
+	return urlspan(x, y, span);
+}
+
+/*
+ * Cell under the pointer while urlmod is held, or x < 0. draw() underlines
+ * the URL there, if any.
+ */
+void
+turlhover(int x, int y)
+{
+	hover.x = x;
+	hover.y = y;
+}
+
+int
+turlhovered(int x, int y)
+{
+	return BETWEEN(y * term.col + x, hover.span[0], hover.span[1] - 1);
+}
+
+/* find the URL under the pointer again, as the screen may have changed */
+static void
+urlhoverupdate(void)
+{
+	int span[2] = {0, 0}, found = 0;
+	char *url;
+
+	if (hover.x >= 0 && (url = urlspan(hover.x, hover.y, span))) {
+		found = 1;
+		free(url);
+	} else {
+		span[0] = span[1] = 0;
+	}
+	if (span[0] == hover.span[0] && span[1] == hover.span[1] &&
+	    hover.col == term.col)
+		return;
+	if (hover.span[1] > 0 && hover.col == term.col)
+		tsetdirt(hover.span[0] / term.col, (hover.span[1] - 1) / term.col);
+	if (found)
+		tsetdirt(span[0] / term.col, (span[1] - 1) / term.col);
+	hover.span[0] = span[0];
+	hover.span[1] = span[1];
+	hover.col = term.col;
+	xsetpointerlink(found);
 }
 
 int
@@ -3051,6 +3130,7 @@ draw(void)
 	if (term.line[term.c.y][cx].mode & ATTR_WDUMMY)
 		cx--;
 
+	urlhoverupdate();
 	drawregion(0, 0, term.col, term.row);
 	if (term.scr == 0)
 		xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
